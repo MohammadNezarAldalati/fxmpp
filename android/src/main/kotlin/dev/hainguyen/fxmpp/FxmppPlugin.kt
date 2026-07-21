@@ -54,6 +54,15 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
     
     private var connectionStateStreamHandler: ConnectionStateStreamHandler? = null
     private var messageStreamHandler: MessageStreamHandler? = null
+
+    // XEP-0085/0184/0333/0444 signaling messages carry no <body>, so Smack's
+// chat2.ChatManager never delivers them to Dart. We forward them ourselves.
+    private val signalingNamespaces = setOf(
+        "http://jabber.org/protocol/chatstates", // XEP-0085 typing
+        "urn:xmpp:receipts",                     // XEP-0184 delivery receipts
+        "urn:xmpp:chat-markers:0",               // XEP-0333 read markers
+        "urn:xmpp:reactions:0"                   // XEP-0444 reactions
+    )
     private var presenceStreamHandler: PresenceStreamHandler? = null
     private var iqStreamHandler: IqStreamHandler? = null
     private var mucEventStreamHandler: MucEventStreamHandler? = null
@@ -410,6 +419,26 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                                 println("FXMPP: Error sending IQ to Dart: ${e.message}")
                                 e.printStackTrace()
                             }
+                        }
+                    }
+                    // Body-less signaling messages (typing, delivery receipts,
+                    // read markers, reactions) are dropped by ChatManager, which
+                    // only delivers messages that carry a <body>. Forward them so
+                    // Dart's live-message handler sees them, matching iOS.
+                    // - no-body => never duplicates the body-bearing messages
+                    //   ChatManager already delivers (incl. text carrying <active/>).
+                    // - MAM <result> (urn:xmpp:mam:2) is body-less too but is not
+                    //   in the allowlist, so archive delivery is untouched.
+                    if (stanza is Message &&
+                        stanza.type != Message.Type.groupchat &&
+                        stanza.bodies.isEmpty() &&
+                        stanza.extensions.any { it.namespace in signalingNamespaces }
+                    ) {
+                        val fromJid = stanza.from?.toString() ?: ""
+                        val xmlString = stanza.toXML().toString()
+                        val messageMap = mapOf("from" to fromJid, "xml" to xmlString)
+                        mainHandler.post {
+                            messageStreamHandler?.sendMessage(messageMap)
                         }
                     }
                 }
