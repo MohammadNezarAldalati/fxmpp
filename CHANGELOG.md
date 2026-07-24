@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-07-24
+
+### Added
+- **Web platform support**: New pure-Dart implementation of `FxmppPlatform` (`FxmppWeb`) using XMPP-over-WebSocket (RFC 7395) — no native or JS XMPP dependency.
+  - Stream negotiation with SASL PLAIN auth and resource binding (`lib/src/web/`).
+  - Requires `wsUrl` in `XmppConnectionConfig` (e.g. `wss://example.com:5443/ws`).
+  - MUC operations are sent as raw XMPP stanzas over the same WebSocket.
+- **Swift Package Manager support**: iOS can now be built via `ios/fxmpp/Package.swift` in addition to CocoaPods; both reference the same source in `ios/fxmpp/Sources/fxmpp/`.
+
+### Fixed
+- **Android typing/signaling indicators**: Body-less signaling messages were dropped by Smack's `ChatManager`, which only delivers messages carrying a `<body>`. These are now forwarded to Dart's message stream, matching iOS behavior — covering XEP-0085 (chat states/typing), XEP-0184 (delivery receipts), XEP-0333 (read markers), and XEP-0444 (reactions). MAM `<result>` archive delivery is intentionally left untouched.
+- **Example app**: Fixed a RenderFlex overflow error and migrated the iOS runner to the UI scene lifecycle.
+
 ## [1.0.0] - 2025-01-18
 
 ### Changed
