@@ -1,6 +1,21 @@
+#if canImport(FlutterMacOS)
+import FlutterMacOS
+#else
 import Flutter
-import UIKit
+#endif
 import XMPPFramework
+
+/// KissXML aliases `NSXMLElement`/`XMLElement` → `DDXMLElement` only on iOS
+/// (`#if TARGET_OS_IPHONE` in KissXML's `DDXML.h`). On macOS those names are
+/// Foundation's own classes, while `DDXMLElement` is a separate class that
+/// `XMPPStream.send` and `addChild` reject. Use each platform's native element
+/// type; the `NSXMLElement (XMPP)` category supplies `init(name:xmlns:)`,
+/// `init(xmlString:)` and `addAttribute(withName:stringValue:)` on both.
+#if os(macOS)
+public typealias XMPPXMLElement = XMLElement
+#else
+public typealias XMPPXMLElement = DDXMLElement
+#endif
 
 public class FxmppPlugin: NSObject, FlutterPlugin {
     private var channel: FlutterMethodChannel?
@@ -25,8 +40,18 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     private var isConnected = false
     private var password: String?
     
+    /// Resolves the binary messenger across platforms: on macOS `messenger` is a
+    /// property, on iOS it is a method.
+    private static func binaryMessenger(from registrar: FlutterPluginRegistrar) -> FlutterBinaryMessenger {
+        #if canImport(FlutterMacOS)
+        return registrar.messenger
+        #else
+        return registrar.messenger()
+        #endif
+    }
+
     public static func register(with registrar: FlutterPluginRegistrar) {
-        let channel = FlutterMethodChannel(name: "fxmpp", binaryMessenger: registrar.messenger())
+        let channel = FlutterMethodChannel(name: "fxmpp", binaryMessenger: FxmppPlugin.binaryMessenger(from: registrar))
         let instance = FxmppPlugin()
         instance.channel = channel
         registrar.addMethodCallDelegate(instance, channel: channel)
@@ -37,27 +62,27 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func setupEventChannels(registrar: FlutterPluginRegistrar) {
         // Connection state event channel
-        connectionStateEventChannel = FlutterEventChannel(name: "fxmpp/connection_state", binaryMessenger: registrar.messenger())
+        connectionStateEventChannel = FlutterEventChannel(name: "fxmpp/connection_state", binaryMessenger: FxmppPlugin.binaryMessenger(from: registrar))
         connectionStateStreamHandler = ConnectionStateStreamHandler()
         connectionStateEventChannel?.setStreamHandler(connectionStateStreamHandler)
         
         // Message event channel
-        messageEventChannel = FlutterEventChannel(name: "fxmpp/messages", binaryMessenger: registrar.messenger())
+        messageEventChannel = FlutterEventChannel(name: "fxmpp/messages", binaryMessenger: FxmppPlugin.binaryMessenger(from: registrar))
         messageStreamHandler = MessageStreamHandler()
         messageEventChannel?.setStreamHandler(messageStreamHandler)
         
         // Presence event channel
-        presenceEventChannel = FlutterEventChannel(name: "fxmpp/presence", binaryMessenger: registrar.messenger())
+        presenceEventChannel = FlutterEventChannel(name: "fxmpp/presence", binaryMessenger: FxmppPlugin.binaryMessenger(from: registrar))
         presenceStreamHandler = PresenceStreamHandler()
         presenceEventChannel?.setStreamHandler(presenceStreamHandler)
         
         // IQ event channel
-        iqEventChannel = FlutterEventChannel(name: "fxmpp/iq", binaryMessenger: registrar.messenger())
+        iqEventChannel = FlutterEventChannel(name: "fxmpp/iq", binaryMessenger: FxmppPlugin.binaryMessenger(from: registrar))
         iqStreamHandler = IqStreamHandler()
         iqEventChannel?.setStreamHandler(iqStreamHandler)
         
         // MUC event channel
-        mucEventChannel = FlutterEventChannel(name: "fxmpp/muc_events", binaryMessenger: registrar.messenger())
+        mucEventChannel = FlutterEventChannel(name: "fxmpp/muc_events", binaryMessenger: FxmppPlugin.binaryMessenger(from: registrar))
         mucEventStreamHandler = MucEventStreamHandler()
         mucEventChannel?.setStreamHandler(mucEventStreamHandler)
     }
@@ -175,7 +200,7 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         }
         
         do {
-            let xmlElement = try DDXMLElement(xmlString: xmlString)
+            let xmlElement = try XMPPXMLElement(xmlString: xmlString)
             xmppStream?.send(xmlElement)
             result(true)
         } catch {
@@ -191,7 +216,7 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         }
         
         do {
-            let xmlElement = try DDXMLElement(xmlString: xmlString)
+            let xmlElement = try XMPPXMLElement(xmlString: xmlString)
             xmppStream?.send(xmlElement)
             result(true)
         } catch {
@@ -207,7 +232,7 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         }
         
         do {
-            let xmlElement = try DDXMLElement(xmlString: xmlString)
+            let xmlElement = try XMPPXMLElement(xmlString: xmlString)
             xmppStream?.send(xmlElement)
             debugPrint("send xmlElement \(xmlElement)")
             result(true)
@@ -230,7 +255,10 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         xmppStream = XMPPStream()
         xmppStream?.addDelegate(self, delegateQueue: DispatchQueue.main)
         
+        // Background sockets are an iOS-only (and deprecated) API, absent on macOS.
+        #if os(iOS)
         xmppStream?.enableBackgroundingOnSocket = true
+        #endif
         
         xmppRoster = XMPPRoster(rosterStorage: XMPPRosterCoreDataStorage.sharedInstance())
         xmppRoster?.activate(xmppStream!)
@@ -365,9 +393,7 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         
         DispatchQueue.global(qos: .background).async {
             do {
-                guard let xmlData = xmlString.data(using: .utf8),
-                      let xmlDoc = try? XMLDocument(data: xmlData, options: 0),
-                      let rootElement = xmlDoc.rootElement() else {
+                guard let rootElement = try? XMPPXMLElement(xmlString: xmlString) else {
                     DispatchQueue.main.async {
                         result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML", details: nil))
                     }
@@ -397,9 +423,7 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         
         DispatchQueue.global(qos: .background).async {
             do {
-                guard let xmlData = xmlString.data(using: .utf8),
-                      let xmlDoc = try? XMLDocument(data: xmlData, options: 0),
-                      let rootElement = xmlDoc.rootElement() else {
+                guard let rootElement = try? XMPPXMLElement(xmlString: xmlString) else {
                     DispatchQueue.main.async {
                         result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML", details: nil))
                     }
@@ -698,12 +722,12 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createKickIQ(roomJid: String, nickname: String, reason: String?) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "nick", stringValue: nickname)
         item.addAttribute(withName: "role", stringValue: "none")
         if let reason = reason {
-            let reasonElement = DDXMLElement(name: "reason", stringValue: reason)
+            let reasonElement = XMPPXMLElement(name: "reason", stringValue: reason)
             item.addChild(reasonElement)
         }
         query.addChild(item)
@@ -713,12 +737,12 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createBanIQ(roomJid: String, userJid: String, reason: String?) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "jid", stringValue: userJid)
         item.addAttribute(withName: "affiliation", stringValue: "outcast")
         if let reason = reason {
-            let reasonElement = DDXMLElement(name: "reason", stringValue: reason)
+            let reasonElement = XMPPXMLElement(name: "reason", stringValue: reason)
             item.addChild(reasonElement)
         }
         query.addChild(item)
@@ -728,8 +752,8 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createGrantVoiceIQ(roomJid: String, nickname: String) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "nick", stringValue: nickname)
         item.addAttribute(withName: "role", stringValue: "participant")
         query.addChild(item)
@@ -739,8 +763,8 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createRevokeVoiceIQ(roomJid: String, nickname: String) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "nick", stringValue: nickname)
         item.addAttribute(withName: "role", stringValue: "visitor")
         query.addChild(item)
@@ -750,8 +774,8 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createGrantModeratorIQ(roomJid: String, nickname: String) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "nick", stringValue: nickname)
         item.addAttribute(withName: "role", stringValue: "moderator")
         query.addChild(item)
@@ -761,8 +785,8 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createGrantMembershipIQ(roomJid: String, userJid: String) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "jid", stringValue: userJid)
         item.addAttribute(withName: "affiliation", stringValue: "member")
         query.addChild(item)
@@ -772,8 +796,8 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createGrantAdminIQ(roomJid: String, userJid: String) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = DDXMLElement(name: "item")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let item = XMPPXMLElement(name: "item")
         item.addAttribute(withName: "jid", stringValue: userJid)
         item.addAttribute(withName: "affiliation", stringValue: "admin")
         query.addChild(item)
@@ -783,13 +807,13 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private func createDestroyRoomIQ(roomJid: String, alternativeRoom: String?, reason: String?) -> XMPPIQ {
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = DDXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#owner")
-        let destroy = DDXMLElement(name: "destroy")
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#owner")
+        let destroy = XMPPXMLElement(name: "destroy")
         if let altRoom = alternativeRoom {
             destroy.addAttribute(withName: "jid", stringValue: altRoom)
         }
         if let reason = reason {
-            let reasonElement = DDXMLElement(name: "reason", stringValue: reason)
+            let reasonElement = XMPPXMLElement(name: "reason", stringValue: reason)
             destroy.addChild(reasonElement)
         }
         query.addChild(destroy)
@@ -826,7 +850,7 @@ extension FxmppPlugin: XMPPStreamDelegate {
         xmppStream?.send(presence)
     }
     
-    public func xmppStream(_ sender: XMPPStream, didNotAuthenticate error: DDXMLElement) {
+    public func xmppStream(_ sender: XMPPStream, didNotAuthenticate error: XMPPXMLElement) {
         debugPrint("XMPP stream authentication failed: \(error)")
         connectionStateStreamHandler?.sendConnectionState(5) // authentication failed
     }

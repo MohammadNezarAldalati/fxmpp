@@ -1,0 +1,1 @@
+../../../../ios/fxmpp/Sources/fxmpp/FxmppPlugin.swift

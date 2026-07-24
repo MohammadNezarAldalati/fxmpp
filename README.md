@@ -1,12 +1,12 @@
 # FXMPP
 
-A Flutter plugin for XMPP (Extensible Messaging and Presence Protocol) communication, supporting both iOS and Android platforms with real-time messaging capabilities.
+A Flutter plugin for XMPP (Extensible Messaging and Presence Protocol) communication, supporting iOS, macOS, Android, and Web platforms with real-time messaging capabilities.
 
 ![mobile](./example/assets/mobile_clients.png)
 
 ## Features
 
-- ✅ Minimal dependencies (xml(Dart), [Smack](https://github.com/igniterealtime/Smack) for Android, [XMPPFramework](https://github.com/robbiehanson/XMPPFramework) for iOS)
+- ✅ Minimal dependencies (xml(Dart), [Smack](https://github.com/igniterealtime/Smack) for Android, [XMPPFramework](https://github.com/robbiehanson/XMPPFramework) for iOS/macOS)
 - ✅ Pure XMPP interpreter.
 - ✅ Easy to customize.
 - ✅ Stream-based architecture
@@ -208,6 +208,18 @@ The example app includes:
 ### iOS
 
 The iOS implementation uses XMPPFramework. No additional setup is required as the framework is automatically included via CocoaPods.
+
+### macOS
+
+The macOS implementation reuses the same native code as iOS (XMPPFramework). Two things to note:
+
+- **Swift Package Manager is required.** For macOS the plugin ships a Swift package only (no CocoaPods podspec), so your macOS app must have [Swift Package Manager support enabled](https://docs.flutter.dev/packages-and-plugins/swift-package-manager/for-app-developers). SPM is the default for new Flutter macOS apps.
+- **Network entitlement.** macOS apps are sandboxed, so add the network client entitlement to both `macos/Runner/DebugProfile.entitlements` and `macos/Runner/Release.entitlements`, otherwise connections fail:
+
+  ```xml
+  <key>com.apple.security.network.client</key>
+  <true/>
+  ```
 
 ### Android
 
