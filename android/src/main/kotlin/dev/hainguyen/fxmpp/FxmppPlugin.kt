@@ -68,6 +68,7 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
     private var mucEventStreamHandler: MucEventStreamHandler? = null
     
     private var connection: AbstractXMPPConnection? = null
+    private var connectionListener: ConnectionListener? = null
     private var chatManager: ChatManager? = null
     private var roster: Roster? = null
     private var mucManager: MultiUserChatManager? = null
@@ -146,6 +147,10 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         
         Thread {
             try {
+                // Retire the previous connection unconditionally — see
+                // `teardownConnection`.
+                teardownConnection()
+
                 val configBuilder = XMPPTCPConnectionConfiguration.builder()
                     .setHost(host)
                     .setPort(port)
@@ -164,8 +169,8 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                 
                 val config = configBuilder.build()
                 connection = XMPPTCPConnection(config)
-                
-                connection?.addConnectionListener(object : ConnectionListener {
+
+                val listener = object : ConnectionListener {
                     override fun connected(connection: XMPPConnection) {
                         mainHandler.post {
                             connectionStateStreamHandler?.sendConnectionState(1) // connecting
@@ -190,8 +195,10 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                             connectionStateStreamHandler?.sendConnectionState(6) // connection lost
                         }
                     }
-                })
-                
+                }
+                connectionListener = listener
+                connection?.addConnectionListener(listener)
+
                 connection?.connect()
                 connection?.login(username, password)
                 
@@ -208,10 +215,39 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         }.start()
     }
     
+    /**
+     * Disconnects and releases the current connection.
+     *
+     * `handleConnect` builds a brand-new `XMPPTCPConnection` on every call, so
+     * without this the previous one stayed alive and logged in — still holding
+     * its listeners, still feeding connection-state events into the single event
+     * channel, and still occupying the same resource as the new session, which
+     * makes the server evict whichever of the two is older.
+     *
+     * Blocks on socket close, so callers must already be off the main thread.
+     */
+    private fun teardownConnection() {
+        val previous = connection ?: return
+        // Detach first, so this teardown doesn't surface to Dart as a spurious
+        // `disconnected` event mid-reconnect.
+        connectionListener?.let { previous.removeConnectionListener(it) }
+        connectionListener = null
+        connection = null
+        chatManager = null
+        roster = null
+        mucManager = null
+        joinedRooms.clear()
+        try {
+            previous.disconnect()
+        } catch (e: Exception) {
+            // Best effort: closing an already-broken socket can throw.
+        }
+    }
+
     private fun handleDisconnect(result: Result) {
         Thread {
             try {
-                connection?.disconnect()
+                teardownConnection()
                 mainHandler.post {
                     connectionStateStreamHandler?.sendConnectionState(0) // disconnected
                     result.success(null)

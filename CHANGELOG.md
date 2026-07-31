@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.3] - 2026-08-01
+
+### Fixed
+- **Endless reconnect loop (iOS/macOS/Android)**: `connect` built a fresh stream/connection on every call but only retired the previous one when it happened to be connected at that instant. After a drop it was already disconnected, so it was orphaned rather than closed — still retained by its own modules, still holding this plugin as its delegate, and still able to log back in under the same resource as the new session. Servers that resolve resource conflicts by keeping the newest session (ejabberd's default) then evicted whichever session was older, and the two took turns kicking each other every few seconds. `connect` and `disconnect` now tear the previous stream down unconditionally: modules and joined rooms are deactivated, delegates/listeners detached, then the socket is closed.
+- **Stale streams reaching Dart (iOS/macOS)**: stream delegate callbacks now ignore any stream that is no longer the live one, and act on the `sender` they were handed rather than on whichever stream is current. Previously a dying stream's `didConnect` could trigger an `authenticate` on the live one (surfacing to Dart as an `error` state), and its disconnect cleared `isConnected` for a healthy session.
+
+### Removed
+- **`XMPPReconnect` (iOS/macOS)**: reconnection is the caller's responsibility. The native reconnector redialed the same account behind Dart's back, racing the caller's own reconnect logic and producing the duplicate sessions described above. Apps that relied on it should drive `connect` from their own connection-state listener.
+
 ## [1.0.2] - 2026-07-24
 
 ### Added

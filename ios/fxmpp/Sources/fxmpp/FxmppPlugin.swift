@@ -33,7 +33,6 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     
     private var xmppStream: XMPPStream?
     private var xmppRoster: XMPPRoster?
-    private var xmppReconnect: XMPPReconnect?
     private var xmppMUC: XMPPMUC?
     
     private var joinedRooms: [String: XMPPRoom] = [:]
@@ -151,11 +150,9 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         
         self.password = password
         
-        // Disconnect existing connection if any
-        if xmppStream?.isConnected == true {
-            xmppStream?.disconnect()
-        }
-        
+        // Retire the previous stream unconditionally — see `teardownXMPPStream`.
+        teardownXMPPStream()
+
         setupXMPPStream()
         
         xmppStream?.hostName = host
@@ -187,7 +184,7 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     }
     
     private func handleDisconnect(result: @escaping FlutterResult) {
-        xmppStream?.disconnect()
+        teardownXMPPStream()
         connectionStateStreamHandler?.sendConnectionState(0) // disconnected
         result(nil)
     }
@@ -263,16 +260,58 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         xmppRoster = XMPPRoster(rosterStorage: XMPPRosterCoreDataStorage.sharedInstance())
         xmppRoster?.activate(xmppStream!)
         xmppRoster?.addDelegate(self, delegateQueue: DispatchQueue.main)
-        
-        xmppReconnect = XMPPReconnect()
-        xmppReconnect?.activate(xmppStream!)
-        
+
+        // No XMPPReconnect here on purpose: reconnection is the Dart caller's
+        // job. A native reconnector redialing the same account behind Dart's
+        // back races the caller's own `connect`, and both sessions share one
+        // resource, so the server evicts whichever is older — an endless
+        // kick-each-other loop.
+
         // Setup MUC
         xmppMUC = XMPPMUC()
         xmppMUC?.activate(xmppStream!)
         xmppMUC?.addDelegate(self, delegateQueue: DispatchQueue.main)
     }
-    
+
+    /// Dismantles the current stream and its modules.
+    ///
+    /// `handleConnect` builds a brand-new `XMPPStream` on every call, so without
+    /// this the previous one stayed alive: its modules retain it, it retains them,
+    /// and `self` was still its delegate — so a discarded stream kept feeding
+    /// connection-state events into the single event channel and could still be
+    /// logged in under the same resource as the live session.
+    private func teardownXMPPStream() {
+        for room in joinedRooms.values {
+            room.removeDelegate(self)
+            room.deactivate()
+        }
+        joinedRooms.removeAll()
+
+        xmppMUC?.removeDelegate(self)
+        xmppMUC?.deactivate()
+        xmppMUC = nil
+
+        xmppRoster?.removeDelegate(self)
+        xmppRoster?.deactivate()
+        xmppRoster = nil
+
+        // Drop the delegate before disconnecting so this teardown doesn't surface
+        // to Dart as a spurious `disconnected`/`connectionLost` event.
+        xmppStream?.removeDelegate(self)
+        xmppStream?.disconnect()
+        xmppStream = nil
+
+        isConnected = false
+    }
+
+    /// Whether a delegate callback came from the live stream. `teardownXMPPStream`
+    /// makes stale streams the exception rather than the rule, but a socket
+    /// already closing when it runs can still call back afterwards — those events
+    /// must not touch `isConnected` or reach Dart.
+    private func isCurrent(_ stream: XMPPStream) -> Bool {
+        return stream === xmppStream
+    }
+
     // MARK: - MUC Method Handlers
     
     private func handleJoinMucRoom(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -833,29 +872,33 @@ extension FxmppPlugin: XMPPStreamDelegate {
     }
     
     public func xmppStreamDidConnect(_ sender: XMPPStream) {
+        guard isCurrent(sender) else { return }
         do {
-            try xmppStream?.authenticate(withPassword: password ?? "")
+            try sender.authenticate(withPassword: password ?? "")
         } catch let error {
             debugPrint("Authentication error: \(error.localizedDescription)")
             connectionStateStreamHandler?.sendConnectionState(4) // error
         }
     }
-    
+
     public func xmppStreamDidAuthenticate(_ sender: XMPPStream) {
+        guard isCurrent(sender) else { return }
         isConnected = true
         connectionStateStreamHandler?.sendConnectionState(2) // connected
-        
+
         // Send initial presence
         let presence = XMPPPresence()
-        xmppStream?.send(presence)
+        sender.send(presence)
     }
-    
+
     public func xmppStream(_ sender: XMPPStream, didNotAuthenticate error: XMPPXMLElement) {
+        guard isCurrent(sender) else { return }
         debugPrint("XMPP stream authentication failed: \(error)")
         connectionStateStreamHandler?.sendConnectionState(5) // authentication failed
     }
-    
+
     public func xmppStreamDidDisconnect(_ sender: XMPPStream, withError error: Error?) {
+        guard isCurrent(sender) else { return }
         debugPrint("XMPP stream disconnected with error: \(error?.localizedDescription ?? "No error")")
         isConnected = false
         if let error = error {
@@ -867,11 +910,13 @@ extension FxmppPlugin: XMPPStreamDelegate {
     }
     
     public func xmppStream(_ sender: XMPPStream, didReceive message: XMPPMessage) {
+        guard isCurrent(sender) else { return }
         let xmlString = message.xmlString
         messageStreamHandler?.sendMessage(xmlString)
     }
-    
+
     public func xmppStream(_ sender: XMPPStream, didReceive presence: XMPPPresence) {
+        guard isCurrent(sender) else { return }
         let xmlString = presence.xmlString
         presenceStreamHandler?.sendPresence(xmlString)
     }
@@ -886,6 +931,7 @@ extension FxmppPlugin: XMPPStreamDelegate {
     }
     
     public func xmppStream(_ sender: XMPPStream, didReceive iq: XMPPIQ) -> Bool {
+        guard isCurrent(sender) else { return false }
         let xmlString = iq.xmlString
         iqStreamHandler?.sendIq(xmlString)
         
