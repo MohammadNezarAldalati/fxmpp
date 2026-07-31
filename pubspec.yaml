@@ -5,22 +5,22 @@ homepage: https://hainguyen.dev
 repository: https://github.com/haithngn/fxmpp
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
-  flutter: ">=3.3.0"
+  sdk: '>=3.12.0 <4.0.0'
+  flutter: ">=3.44.0"
 
 dependencies:
   flutter:
     sdk: flutter
   flutter_web_plugins:
     sdk: flutter
-  plugin_platform_interface: ^2.1.7
-  xml: ^6.5.0
+  plugin_platform_interface: ^2.1.8
+  xml: ^7.0.1
   web: ^1.1.1
 
 dev_dependencies:
   flutter_test:
     sdk: flutter
-  flutter_lints: ^3.0.0
+  flutter_lints: ^6.0.0
 
 flutter:
   plugin:
