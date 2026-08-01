@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-08-01
+
+### Fixed
+- **Outgoing IQ payloads silently stripped (Android)**: `sendIq` reparsed the caller's XML with `PacketParserUtils.parseStanza` and transmitted the reconstructed object. When Smack has no `IQProvider` for the payload it falls back to `UnparsedIQ`, which re-serializes the child element by XML-*escaping* it into a text node — so the payload arrived as inert text with every attribute lost. XEP-0363 was the common casualty: Smack registers its provider only via `HttpFileUploadManager`, which this plugin never constructs, so upload slot requests reached the server carrying no `filename`, `size` or `content-type`, no slot was ever granted, and file uploads were impossible on Android. iOS/macOS were unaffected because they write the caller's XML to the stream verbatim. `sendIq` now detects the `UnparsedIQ` fallback and sends the original XML as-is; stanzas Smack parses successfully still go through `sendStanza` unchanged.
+
 ## [1.0.3] - 2026-08-01
 
 ### Fixed

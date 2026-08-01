@@ -23,8 +23,11 @@ import org.jivesoftware.smack.chat2.IncomingChatMessageListener
 import org.jivesoftware.smack.filter.StanzaTypeFilter
 import org.jivesoftware.smack.packet.IQ
 import org.jivesoftware.smack.packet.Message
+import org.jivesoftware.smack.packet.Nonza
 import org.jivesoftware.smack.packet.Presence
 import org.jivesoftware.smack.packet.Stanza
+import org.jivesoftware.smack.packet.UnparsedIQ
+import org.jivesoftware.smack.packet.XmlEnvironment
 import org.jivesoftware.smack.roster.Roster
 import org.jivesoftware.smack.tcp.XMPPTCPConnection
 import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration
@@ -359,8 +362,18 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                 // Parse XML string to create proper stanza
                 val stanza: Stanza = PacketParserUtils.parseStanza(xmlString)
                 println("FXMPP: Parsed IQ stanza: ${stanza.toXML()}")
-                
-                connection!!.sendStanza(stanza)
+
+                if (stanza is UnparsedIQ) {
+                    // No IQProvider is registered for this payload, so Smack fell
+                    // back to UnparsedIQ — which re-serializes the child element by
+                    // XML-*escaping* it into a text node. The payload's attributes
+                    // are silently lost, e.g. an XEP-0363 slot request reaches the
+                    // server as <request/> with no filename/size/content-type and
+                    // no slot is ever granted. Send the caller's XML verbatim.
+                    connection!!.sendNonza(RawXml("iq", xmlString))
+                } else {
+                    connection!!.sendStanza(stanza)
+                }
                 println("FXMPP: IQ sent successfully")
                 
                 mainHandler.post {
@@ -1433,6 +1446,18 @@ class MucEventStreamHandler : EventChannel.StreamHandler {
     fun sendEvent(event: Map<String, Any>) {
         eventSink?.success(event)
     }
+}
+
+/// Writes a caller-supplied stanza to the stream byte for byte.
+///
+/// Smack can only re-serialize what it has a provider for; anything else is
+/// mangled on the way out (see [FxmppPlugin.handleSendIq]). A Nonza is just an
+/// Element the connection will write verbatim, which is what we want for XML
+/// that Dart already built correctly.
+class RawXml(private val element: String, private val xml: String) : Nonza {
+    override fun getElementName(): String = element
+    override fun getNamespace(): String = "jabber:client"
+    override fun toXML(xmlEnvironment: XmlEnvironment?): CharSequence = xml
 }
 
 // Trust manager for self-signed certificates
