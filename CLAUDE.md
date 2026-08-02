@@ -12,17 +12,13 @@ fxmpp is a Flutter plugin providing XMPP (Extensible Messaging and Presence Prot
 # Get dependencies
 flutter pub get
 
-# Run the example app
-cd example && flutter run
-
 # Analyze Dart code
 flutter analyze
-
-# Run tests (no test directory currently exists)
-flutter test
 ```
 
-iOS native dependencies are managed via CocoaPods (`ios/fxmpp.podspec`) or Swift Package Manager (`ios/fxmpp/Package.swift`) — both point at the same source in `ios/fxmpp/Sources/fxmpp/`. macOS is Swift Package Manager only (`macos/fxmpp/Package.swift`); its source (`macos/fxmpp/Sources/fxmpp/FxmppPlugin.swift`) is a symlink to the iOS source, so the two Apple platforms compile one shared Swift file. Android dependencies are in `android/build.gradle`. Neither requires manual setup beyond `flutter pub get`.
+There is no example app or test directory (both removed), so `flutter run`/`flutter test` have nothing to target — this is a library-only package. `flutter_test` is not a dependency.
+
+iOS native dependencies are managed via CocoaPods (`ios/fxmpp.podspec`) or Swift Package Manager (`ios/fxmpp/Package.swift`) — both point at the same source in `ios/fxmpp/Sources/fxmpp/`. macOS is Swift Package Manager only (`macos/fxmpp/Package.swift`); its source (`macos/fxmpp/Sources/fxmpp/FxmppPlugin.swift`) is a symlink to the iOS source, so the two Apple platforms compile one shared Swift file. Android dependencies are in `android/build.gradle.kts` (Kotlin DSL, with `android/settings.gradle.kts`). The Android module targets AGP 9 / Kotlin 2.3.20, `compileSdk` 36, `minSdk` 30, Java 17, and relies on AGP's built-in Kotlin support (it applies only `com.android.library`, never the KGP plugin) — **consuming apps must build with AGP 9 and declare `minSdk` ≥ 30**. Neither Apple nor Android requires manual setup beyond `flutter pub get`.
 
 ## Architecture
 
