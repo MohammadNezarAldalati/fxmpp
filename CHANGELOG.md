@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-08-02
+
+### Changed
+- **Android Gradle build migrated to Kotlin DSL**: `android/build.gradle` is replaced by `android/build.gradle.kts`, and a new `android/settings.gradle.kts` declares `rootProject.name`. The layout now follows the Flutter 3.44.8 plugin template: Android Gradle Plugin 9.0.1 and Kotlin 2.3.20 on the `buildscript` classpath, `compileSdk` 36, and `sourceCompatibility`/`targetCompatibility`/`jvmTarget` raised from Java 8 to Java 17. **This requires consuming apps to build with AGP 9.** A Flutter plugin's Android module is compiled as a subproject of the host app's Gradle build, so it is the app's AGP — not the version pinned here — that evaluates this file; apps still on AGP 8 will fail to configure the `:fxmpp` project.
+- **Android now uses AGP's built-in Kotlin support**: the module applies only `com.android.library` and no longer applies the legacy `org.jetbrains.kotlin.android` plugin, configuring the compiler through the top-level `kotlin { compilerOptions { } }` block instead. Kotlin Gradle Plugin remains on the `buildscript` classpath but is never applied. This removes `fxmpp` from Flutter's "your app uses the following plugins that apply Kotlin Gradle Plugin (KGP)" warning, which future Flutter versions will escalate to a build failure.
+- **BREAKING — Android `minSdk` raised from 16 to 30**: consuming apps must declare `minSdk` 30 (Android 11) or higher, otherwise manifest merging fails. This is well above Flutter's own floor of 24, so apps using the default `flutter.minSdkVersion` need an explicit override.
+
+### Removed
+- **Explicit `kotlin-stdlib-jdk7` dependency (Android)**: AGP's built-in Kotlin support contributes the standard library itself, and the `kotlin_version` value is not visible outside the `buildscript` block in the Kotlin DSL. Projects depending on the `jdk7` variant specifically being on fxmpp's classpath should declare it themselves.
+- **`flutter_test` dev dependency**: the package ships no Dart tests, so the dependency only constrained resolution for consumers.
+
 ## [1.0.4] - 2026-08-01
 
 ### Fixed
