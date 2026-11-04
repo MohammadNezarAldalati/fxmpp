@@ -16,6 +16,7 @@ import org.jivesoftware.smack.SmackException
 import org.jivesoftware.smack.StanzaListener
 import org.jivesoftware.smack.XMPPConnection
 import org.jivesoftware.smack.XMPPException
+import org.jivesoftware.smack.sasl.SASLErrorException
 import org.jivesoftware.smack.util.PacketParserUtils
 import org.jivesoftware.smack.chat2.Chat
 import org.jivesoftware.smack.chat2.ChatManager
@@ -64,7 +65,8 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         "http://jabber.org/protocol/chatstates", // XEP-0085 typing
         "urn:xmpp:receipts",                     // XEP-0184 delivery receipts
         "urn:xmpp:chat-markers:0",               // XEP-0333 read markers
-        "urn:xmpp:reactions:0"                   // XEP-0444 reactions
+        "urn:xmpp:reactions:0",                  // XEP-0444 reactions
+        "urn:xmpp:mam:2"                         // XEP-0313 archive result wrappers
     )
     private var presenceStreamHandler: PresenceStreamHandler? = null
     private var iqStreamHandler: IqStreamHandler? = null
@@ -210,9 +212,15 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                 }
                 
             } catch (e: Exception) {
+                val authFailed = e is SASLErrorException || e is SmackException.SmackSaslException
                 mainHandler.post {
-                    connectionStateStreamHandler?.sendConnectionState(4) // error
-                    result.error("CONNECTION_ERROR", e.message, null)
+                    if (authFailed) {
+                        connectionStateStreamHandler?.sendConnectionState(5) // authentication failed
+                        result.error("AUTH_FAILED", e.message, null)
+                    } else {
+                        connectionStateStreamHandler?.sendConnectionState(4) // error
+                        result.error("CONNECTION_ERROR", e.message, null)
+                    }
                 }
             }
         }.start()
@@ -476,8 +484,10 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                     // Dart's live-message handler sees them, matching iOS.
                     // - no-body => never duplicates the body-bearing messages
                     //   ChatManager already delivers (incl. text carrying <active/>).
-                    // - MAM <result> (urn:xmpp:mam:2) is body-less too but is not
-                    //   in the allowlist, so archive delivery is untouched.
+                    // - MAM <result> (urn:xmpp:mam:2) wrappers are body-less too
+                    //   (the body sits inside <forwarded>) and come from the bare
+                    //   archive JID, so ChatManager drops them as well; they must
+                    //   be in the allowlist or archive pages never reach Dart.
                     if (stanza is Message &&
                         stanza.type != Message.Type.groupchat &&
                         stanza.bodies.isEmpty() &&

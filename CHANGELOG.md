@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.6] - 2026-11-05
+
+### Fixed
+- **MAM result wrappers never reached Dart (Android)**: XEP-0313 archive pages are delivered as `<message>` wrappers whose only child is `<result xmlns='urn:xmpp:mam:2'>` with the real message nested inside `<forwarded>`. The wrapper has no outer `<body>` and is sent from the bare archive JID, so Smack's `ChatManager` (which requires a body and a full JID) dropped it, and the plugin's own body-less forwarding path only allowed chat-state, receipt, chat-marker and reaction namespaces. Only the closing `<fin>` IQ arrived, so archive catch-up on Android saw zero records. `urn:xmpp:mam:2` is now in that allowlist and the wrapper is forwarded on `messageStream` with its full XML, exactly as on iOS/macOS, which never filtered messages.
+- **Rejected password reported as `error` instead of `authenticationFailed` (Android)**: `connect` ran `connect()` and `login()` under a single catch that always emitted connection state `4` (`error`) and rejected with `CONNECTION_ERROR`, so Dart could not distinguish bad credentials from an unreachable host; state `5` was never emitted on Android. A `SASLErrorException` / `SmackSaslException` from `login()` now emits `authenticationFailed` and rejects with code `AUTH_FAILED` (the message still carries Smack's text, e.g. `SASLError using SCRAM-SHA-1: not-authorized`). Other failures are unchanged. iOS/macOS already emitted `authenticationFailed` from `didNotAuthenticate`.
+
 ## [1.0.5] - 2026-08-02
 
 ### Changed
