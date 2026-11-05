@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:fxmpp/src/core/stanza_id.dart';
 import 'package:fxmpp/src/core/xmpp_connection_config.dart';
 import 'package:fxmpp/src/core/xmpp_connection_state.dart';
 import 'package:xml/xml.dart';
@@ -22,17 +23,14 @@ class XmppStreamException implements Exception {
 class XmppStreamHandler {
   final XmppWebSocket _webSocket;
   final XmppConnectionConfig _config;
-  final void Function(XmppConnectionState) _onStateChange;
 
-  XmppStreamHandler(this._webSocket, this._config, this._onStateChange);
+  XmppStreamHandler(this._webSocket, this._config);
 
   /// Run the full XMPP stream negotiation.
   ///
   /// Returns the full bound JID on success.
   /// Throws [XmppStreamException] on failure.
   Future<String> negotiate() async {
-    _onStateChange(XmppConnectionState.connecting);
-
     // Step 1: Send opening frame
     _sendOpen();
 
@@ -55,11 +53,13 @@ class XmppStreamHandler {
   }
 
   void _sendOpen() {
-    _webSocket.send(
-      '<open xmlns="urn:ietf:params:xml:ns:xmpp-framing"'
-      ' to="${_config.domain}"'
-      ' version="1.0"/>',
-    );
+    final builder = XmlBuilder();
+    builder.element('open', attributes: {
+      'xmlns': 'urn:ietf:params:xml:ns:xmpp-framing',
+      'to': _config.domain,
+      'version': '1.0',
+    });
+    _webSocket.send(builder.buildDocument().toXmlString());
   }
 
   Future<void> _waitForSaslFeatures() async {
@@ -165,12 +165,19 @@ class XmppStreamHandler {
 
   Future<String> _bindResource() async {
     final resource = _config.resource ?? 'fxmpp';
-    _webSocket.send(
-      '<iq type="set" id="bind_1" xmlns="jabber:client">'
-      '<bind xmlns="urn:ietf:params:xml:ns:xmpp-bind">'
-      '<resource>$resource</resource>'
-      '</bind></iq>',
-    );
+    final builder = XmlBuilder();
+    builder.element('iq', attributes: {
+      'xmlns': 'jabber:client',
+      'type': 'set',
+      'id': generateStanzaId('bind'),
+    }, nest: () {
+      builder.element('bind', attributes: {
+        'xmlns': 'urn:ietf:params:xml:ns:xmpp-bind',
+      }, nest: () {
+        builder.element('resource', nest: resource);
+      });
+    });
+    _webSocket.send(builder.buildDocument().toXmlString());
 
     await for (final frame in _webSocket.incoming) {
       final element = _parseFrame(frame);

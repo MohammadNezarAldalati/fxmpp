@@ -1,9 +1,12 @@
 import 'dart:async';
 import 'dart:developer';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:fxmpp/src/core/iq_type.dart';
 import 'package:fxmpp/src/core/message_type.dart';
 import 'package:fxmpp/src/core/muc_room.dart';
 import 'package:fxmpp/src/core/presence_type.dart';
+import 'package:fxmpp/src/core/stanza_id.dart';
 import 'package:fxmpp/src/core/xmpp_connection_config.dart';
 import 'package:fxmpp/src/core/xmpp_connection_state.dart';
 import 'package:xml/xml.dart';
@@ -62,40 +65,47 @@ class Fxmpp {
   /// Get MUC manager instance
   MucManager get mucManager => _mucManager;
 
-  /// Connect to XMPP server
+  /// Connect to XMPP server.
+  ///
+  /// Resolves `true` once the session is authenticated and `false` when the
+  /// connection or authentication failed; the reason (`error` or
+  /// `authenticationFailed`) is reported on [connectionStateStream] by the
+  /// platform itself, on every platform.
   Future<bool> connect(XmppConnectionConfig config) async {
-    log("[XMPP-Connection] connect ${config.toString()}");
+    if (kDebugMode) log("[XMPP-Connection] connect ${config.toString()}");
     try {
-      final result = await FxmppPlatform.instance.connect(config);
-      return result;
-    } catch (e) {
-      _connectionStateController.add(XmppConnectionState.error);
-      rethrow;
+      return await FxmppPlatform.instance.connect(config);
+    } on PlatformException catch (e) {
+      if (kDebugMode) {
+        if (kDebugMode) log("[XMPP-Connection] connect failed: ${e.code} ${e.message}");
+      }
+      return false;
     }
   }
 
-  /// Disconnect from XMPP server
+  /// Disconnect from XMPP server.
+  ///
+  /// The platform emits `disconnected` on [connectionStateStream].
   Future<void> disconnect() async {
     await FxmppPlatform.instance.disconnect();
-    log("[XMPP-Connection] << disconnect");
-    _connectionStateController.add(XmppConnectionState.disconnected);
+    if (kDebugMode) log("[XMPP-Connection] << disconnect");
   }
 
   /// Send a message
   Future<bool> sendMessage(XmlDocument message) async {
-    log("[XMPP-Message] >>> ${message.toXmlString()}");
+    if (kDebugMode) log("[XMPP-Message] >>> ${message.toXmlString()}");
     return await FxmppPlatform.instance.sendMessage(message);
   }
 
   /// Send presence
   Future<bool> sendPresence(XmlDocument presence) async {
-    log("[XMPP-Presence] >>> ${presence.toXmlString()}");
+    if (kDebugMode) log("[XMPP-Presence] >>> ${presence.toXmlString()}");
     return await FxmppPlatform.instance.sendPresence(presence);
   }
 
   /// Send IQ stanza
   Future<bool> sendIq(XmlDocument iq) async {
-    log("[XMPP-IQ] >>> ${iq.toXmlString()}");
+    if (kDebugMode) log("[XMPP-IQ] >>> ${iq.toXmlString()}");
     return await FxmppPlatform.instance.sendIq(iq);
   }
 
@@ -108,32 +118,40 @@ class Fxmpp {
   Future<void> initialize() async {
     await FxmppPlatform.instance.initialize();
 
-    // Set up platform callbacks
+    // Set up platform callbacks. Guard against a disposed singleton: the
+    // platform keeps calling back after dispose() and a closed controller
+    // throws on add().
     FxmppPlatform.instance.setConnectionStateCallback((state) {
-      log("[XMPP-Connection] didChangeConnectionState $state");
-      _connectionStateController.add(state);
+      if (kDebugMode) log("[XMPP-Connection] didChangeConnectionState $state");
+      if (!_connectionStateController.isClosed) {
+        _connectionStateController.add(state);
+      }
     });
 
     FxmppPlatform.instance.setMessageCallback((message) {
-      log("[XMPP-Message] <<< ${message.toXmlString()}");
-      _messageController.add(message);
+      if (kDebugMode) log("[XMPP-Message] <<< ${message.toXmlString()}");
+      if (!_messageController.isClosed) _messageController.add(message);
+      // Room messages update MucManager state (subject) and mucMessageStream.
+      _mucManager.handleMessage(message);
     });
 
     FxmppPlatform.instance.setPresenceCallback((presence) {
-      log("[XMPP-Presence] <<< ${presence.toXmlString()}");
-      _presenceController.add(presence);
+      if (kDebugMode) log("[XMPP-Presence] <<< ${presence.toXmlString()}");
+      if (!_presenceController.isClosed) _presenceController.add(presence);
+      // MUC occupant presence drives joined/participant state on every
+      // platform (the native MUC event channel is a platform-specific extra).
+      _mucManager.handlePresence(presence);
     });
 
     FxmppPlatform.instance.setIqCallback((iq) {
-      log("[XMPP-IQ] <<< ${iq.toXmlString()}");
-      _iqController.add(iq);
+      if (kDebugMode) log("[XMPP-IQ] <<< ${iq.toXmlString()}");
+      if (!_iqController.isClosed) _iqController.add(iq);
     });
 
-    // Set up MUC event handling
+    // Native MUC lifecycle events (Android/iOS only). Room state itself is
+    // derived from presence above, so these are only logged.
     FxmppPlatform.instance.setMucEventCallback((event) {
-      log("[XMPP-MUC] Event: $event");
-      // Handle MUC events through the manager
-      // This will be processed by the native platform and forwarded as events
+      if (kDebugMode) log("[XMPP-MUC] Event: $event");
     });
   }
 
@@ -260,36 +278,11 @@ class Fxmpp {
       'to': toJid,
     }, nest: () {
       if (queryElement != null) {
-        builder.element(queryElement.name.local,
-            attributes: Map.fromEntries(queryElement.attributes
-                .map((attr) => MapEntry(attr.name.local, attr.value))),
-            nest: () {
-          for (final child in queryElement.children) {
-            if (child is XmlElement) {
-              _addElementRecursively(builder, child);
-            } else if (child is XmlText) {
-              builder.text(child.value);
-            }
-          }
-        });
+        // Insert a verbatim copy (prefixes, namespaces and CDATA included).
+        builder.xml(queryElement.toXmlString());
       }
     });
     return builder.buildDocument();
-  }
-
-  /// Helper method to recursively add XML elements
-  static void _addElementRecursively(XmlBuilder builder, XmlElement element) {
-    builder.element(element.name.local,
-        attributes: Map.fromEntries(element.attributes
-            .map((attr) => MapEntry(attr.name.local, attr.value))), nest: () {
-      for (final child in element.children) {
-        if (child is XmlElement) {
-          _addElementRecursively(builder, child);
-        } else if (child is XmlText) {
-          builder.text(child.value);
-        }
-      }
-    });
   }
 
   /// Create a disco#info IQ query
@@ -376,11 +369,8 @@ class Fxmpp {
   /// Generate a unique ID for stanzas
   ///
   /// [prefix] - Optional prefix for the ID
-  static String generateId([String prefix = 'fxmpp']) {
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
-    final random = (timestamp % 10000).toString().padLeft(4, '0');
-    return '${prefix}_${timestamp}_$random';
-  }
+  static String generateId([String prefix = 'fxmpp']) =>
+      generateStanzaId(prefix);
 
   /// Create a MUC room message stanza (groupchat type)
   ///
@@ -467,7 +457,8 @@ class Fxmpp {
     int? maxStanzas,
     DateTime? since,
   }) async {
-    log("[XMPP-MUC] Joining room $roomJid as $nickname");
+    if (kDebugMode) log("[XMPP-MUC] Joining room $roomJid as $nickname");
+    _mucManager.registerRoom(roomJid: roomJid, nickname: nickname);
     return await FxmppPlatform.instance.joinMucRoom(
       roomJid: roomJid,
       nickname: nickname,
@@ -485,7 +476,7 @@ class Fxmpp {
     required String roomJid,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Leaving room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Leaving room $roomJid");
     return await FxmppPlatform.instance.leaveMucRoom(
       roomJid: roomJid,
       reason: reason,
@@ -502,7 +493,8 @@ class Fxmpp {
     required String nickname,
     String? password,
   }) async {
-    log("[XMPP-MUC] Creating room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Creating room $roomJid");
+    _mucManager.registerRoom(roomJid: roomJid, nickname: nickname);
     return await FxmppPlatform.instance.createMucRoom(
       roomJid: roomJid,
       nickname: nickname,
@@ -514,7 +506,7 @@ class Fxmpp {
   ///
   /// [message] - The XML document representing the message stanza
   Future<bool> sendMucMessage(XmlDocument message) async {
-    log("[XMPP-MUC] >>> ${message.toXmlString()}");
+    if (kDebugMode) log("[XMPP-MUC] >>> ${message.toXmlString()}");
     return await FxmppPlatform.instance.sendMucMessage(message);
   }
 
@@ -522,7 +514,7 @@ class Fxmpp {
   ///
   /// [message] - The XML document representing the private message stanza
   Future<bool> sendMucPrivateMessage(XmlDocument message) async {
-    log("[XMPP-MUC-Private] >>> ${message.toXmlString()}");
+    if (kDebugMode) log("[XMPP-MUC-Private] >>> ${message.toXmlString()}");
     return await FxmppPlatform.instance.sendMucPrivateMessage(message);
   }
 
@@ -534,7 +526,7 @@ class Fxmpp {
     required String roomJid,
     required String subject,
   }) async {
-    log("[XMPP-MUC] Changing subject in room $roomJid to: $subject");
+    if (kDebugMode) log("[XMPP-MUC] Changing subject in room $roomJid to: $subject");
     return await FxmppPlatform.instance.changeMucSubject(
       roomJid: roomJid,
       subject: subject,
@@ -551,7 +543,7 @@ class Fxmpp {
     required String nickname,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Kicking $nickname from room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Kicking $nickname from room $roomJid");
     return await FxmppPlatform.instance.kickMucParticipant(
       roomJid: roomJid,
       nickname: nickname,
@@ -569,7 +561,7 @@ class Fxmpp {
     required String userJid,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Banning $userJid from room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Banning $userJid from room $roomJid");
     return await FxmppPlatform.instance.banMucUser(
       roomJid: roomJid,
       userJid: userJid,
@@ -587,7 +579,7 @@ class Fxmpp {
     required String nickname,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Granting voice to $nickname in room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Granting voice to $nickname in room $roomJid");
     return await FxmppPlatform.instance.grantMucVoice(
       roomJid: roomJid,
       nickname: nickname,
@@ -605,7 +597,7 @@ class Fxmpp {
     required String nickname,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Revoking voice from $nickname in room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Revoking voice from $nickname in room $roomJid");
     return await FxmppPlatform.instance.revokeMucVoice(
       roomJid: roomJid,
       nickname: nickname,
@@ -623,7 +615,7 @@ class Fxmpp {
     required String nickname,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Granting moderator to $nickname in room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Granting moderator to $nickname in room $roomJid");
     return await FxmppPlatform.instance.grantMucModerator(
       roomJid: roomJid,
       nickname: nickname,
@@ -641,7 +633,7 @@ class Fxmpp {
     required String userJid,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Granting membership to $userJid in room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Granting membership to $userJid in room $roomJid");
     return await FxmppPlatform.instance.grantMucMembership(
       roomJid: roomJid,
       userJid: userJid,
@@ -659,7 +651,7 @@ class Fxmpp {
     required String userJid,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Granting admin to $userJid in room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Granting admin to $userJid in room $roomJid");
     return await FxmppPlatform.instance.grantMucAdmin(
       roomJid: roomJid,
       userJid: userJid,
@@ -677,7 +669,7 @@ class Fxmpp {
     required String userJid,
     String? reason,
   }) async {
-    log("[XMPP-MUC] Inviting $userJid to room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Inviting $userJid to room $roomJid");
     return await FxmppPlatform.instance.inviteMucUser(
       roomJid: roomJid,
       userJid: userJid,
@@ -695,7 +687,7 @@ class Fxmpp {
     String? reason,
     String? alternativeRoom,
   }) async {
-    log("[XMPP-MUC] Destroying room $roomJid");
+    if (kDebugMode) log("[XMPP-MUC] Destroying room $roomJid");
     return await FxmppPlatform.instance.destroyMucRoom(
       roomJid: roomJid,
       reason: reason,

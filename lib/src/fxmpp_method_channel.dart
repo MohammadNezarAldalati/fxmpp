@@ -101,8 +101,10 @@ class MethodChannelFxmpp extends FxmppPlatform {
     });
 
     mucEventChannel.receiveBroadcastStream().listen((event) {
-      if (_mucEventCallback != null && event is Map<String, dynamic>) {
-        _mucEventCallback!(event);
+      // The codec decodes maps as Map<Object?, Object?>, never as
+      // Map<String, dynamic>, so convert instead of type-testing.
+      if (_mucEventCallback != null && event is Map) {
+        _mucEventCallback!(Map<String, dynamic>.from(event));
       }
     });
   }

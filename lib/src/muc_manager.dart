@@ -6,6 +6,7 @@ import 'package:fxmpp/src/core/muc_affiliation.dart';
 import 'package:fxmpp/src/core/muc_participant.dart';
 import 'package:fxmpp/src/core/muc_role.dart';
 import 'package:fxmpp/src/core/muc_room.dart';
+import 'package:fxmpp/src/core/stanza_id.dart';
 import 'package:xml/xml.dart';
 
 /// Manager class for MUC (Multi-User Chat) operations
@@ -76,14 +77,23 @@ class MucManager {
       });
     });
 
-    // Add room to local cache
-    _rooms[roomJid] = MucRoom(
-      jid: roomJid,
-      userNickname: nickname,
-      config: config ?? const MucRoomConfig(),
-    );
+    registerRoom(roomJid: roomJid, nickname: nickname, config: config);
 
     return builder.buildDocument();
+  }
+
+  /// Track a room the user is joining so that incoming MUC presence and
+  /// messages (see [handlePresence] / [handleMessage]) update its state.
+  void registerRoom({
+    required String roomJid,
+    required String nickname,
+    MucRoomConfig? config,
+  }) {
+    final existingRoom = _rooms[roomJid];
+    _rooms[roomJid] = (existingRoom ?? MucRoom(jid: roomJid)).copyWith(
+      userNickname: nickname,
+      config: config,
+    );
   }
 
   /// Join an existing MUC room
@@ -124,11 +134,7 @@ class MucManager {
       });
     });
 
-    // Add or update room in local cache
-    final existingRoom = _rooms[roomJid];
-    _rooms[roomJid] = (existingRoom ?? MucRoom(jid: roomJid)).copyWith(
-      userNickname: nickname,
-    );
+    registerRoom(roomJid: roomJid, nickname: nickname);
 
     return builder.buildDocument();
   }
@@ -180,7 +186,7 @@ class MucManager {
       throw StateError('Not joined to room $roomJid');
     }
 
-    final messageId = _generateId('msg');
+    final messageId = generateStanzaId('msg');
     final builder = XmlBuilder();
     builder.element('message', attributes: {
       'xmlns': 'jabber:client',
@@ -217,7 +223,7 @@ class MucManager {
       throw StateError('Not joined to room $roomJid');
     }
 
-    final messageId = _generateId('pm');
+    final messageId = generateStanzaId('pm');
     final builder = XmlBuilder();
     builder.element('message', attributes: {
       'xmlns': 'jabber:client',
@@ -246,7 +252,7 @@ class MucManager {
       throw StateError('Not joined to room $roomJid');
     }
 
-    final messageId = _generateId('subj');
+    final messageId = generateStanzaId('subj');
     final builder = XmlBuilder();
     builder.element('message', attributes: {
       'xmlns': 'jabber:client',
@@ -412,7 +418,7 @@ class MucManager {
     required String userJid,
     String? reason,
   }) {
-    final messageId = _generateId('invite');
+    final messageId = generateStanzaId('invite');
     final builder = XmlBuilder();
     builder.element('message', attributes: {
       'xmlns': 'jabber:client',
@@ -447,7 +453,7 @@ class MucManager {
     String? reason,
     String? alternativeRoom,
   }) {
-    final iqId = _generateId('destroy');
+    final iqId = generateStanzaId('destroy');
     final builder = XmlBuilder();
     builder.element('iq', attributes: {
       'xmlns': 'jabber:client',
@@ -526,12 +532,12 @@ class MucManager {
       final room = _rooms[roomJid];
       if (room == null || !room.isJoined) return;
 
-      final body = message.findElements('body').firstOrNull?.value;
-      final subject = message.findElements('subject').firstOrNull?.value;
-      final thread = message.findElements('thread').firstOrNull?.value;
+      final body = message.findElements('body').firstOrNull?.innerText;
+      final subject = message.findElements('subject').firstOrNull?.innerText;
+      final thread = message.findElements('thread').firstOrNull?.innerText;
 
       final mucMessage = MucMessage(
-        id: id ?? _generateId('msg'),
+        id: id ?? generateStanzaId('msg'),
         roomJid: roomJid,
         senderNickname: nickname,
         body: body,
@@ -566,7 +572,7 @@ class MucManager {
     required MucRole role,
     String? reason,
   }) {
-    final iqId = _generateId('role');
+    final iqId = generateStanzaId('role');
     final builder = XmlBuilder();
     builder.element('iq', attributes: {
       'xmlns': 'jabber:client',
@@ -600,7 +606,7 @@ class MucManager {
     required MucAffiliation affiliation,
     String? reason,
   }) {
-    final iqId = _generateId('affiliation');
+    final iqId = generateStanzaId('affiliation');
     final builder = XmlBuilder();
     builder.element('iq', attributes: {
       'xmlns': 'jabber:client',
@@ -637,8 +643,8 @@ class MucManager {
         MucAffiliation.fromString(item.getAttribute('affiliation') ?? 'none');
     final realJid = item.getAttribute('jid');
 
-    final show = presence.findElements('show').firstOrNull?.value;
-    final status = presence.findElements('status').firstOrNull?.value;
+    final show = presence.findElements('show').firstOrNull?.innerText;
+    final status = presence.findElements('status').firstOrNull?.innerText;
 
     final participant = MucParticipant(
       nickname: nickname,
@@ -724,13 +730,6 @@ class MucManager {
         participant: participant,
       ));
     }
-  }
-
-  /// Generate a unique ID
-  String _generateId([String prefix = 'muc']) {
-    final timestamp = DateTime.now().millisecondsSinceEpoch;
-    final random = (timestamp % 10000).toString().padLeft(4, '0');
-    return '${prefix}_${timestamp}_$random';
   }
 
   /// Dispose resources

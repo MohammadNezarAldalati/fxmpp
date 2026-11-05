@@ -217,59 +217,34 @@ class XEP_0424 {
     String? fallbackText,
     bool includeStoreHint = true,
   }) {
-    final builder = XmlBuilder();
-    final rootElement = messageXml.rootElement;
+    // Deep-copy the original message verbatim (prefixes, namespaces and
+    // CDATA included), drop its body and prepend the retraction elements.
+    final doc = messageXml.copy();
+    final root = doc.rootElement;
+    root.children.removeWhere(
+        (child) => child is XmlElement && child.name.local == 'body');
 
-    // Copy the original message structure
-    builder.element(rootElement.name.local, attributes: {
-      for (final attr in rootElement.attributes) attr.name.local: attr.value,
-    }, nest: () {
-      // Add retraction element first
-      builder.element('retract', attributes: {
-        'id': originalMessageId,
-        'xmlns': 'urn:xmpp:message-retract:1',
-      });
-
-      // Add fallback indication
-      builder.element('fallback', attributes: {
-        'xmlns': 'urn:xmpp:fallback:0',
-        'for': 'urn:xmpp:message-retract:1',
-      });
-
-      // Add or replace body with fallback text
-      final bodyText = fallbackText ??
-          '/me retracted a previous message, but it\'s unsupported by your client.';
-      builder.element('body', nest: bodyText);
-
-      // Copy other existing child elements (except body)
-      for (final child in rootElement.children) {
-        if (child is XmlElement && child.name.local != 'body') {
-          _copyElement(builder, child);
-        }
-      }
-
-      // Add store hint if requested
-      if (includeStoreHint) {
-        builder.element('store', attributes: {
-          'xmlns': 'urn:xmpp:hints',
-        });
-      }
+    final bodyText = fallbackText ??
+        '/me retracted a previous message, but it\'s unsupported by your client.';
+    final head = XmlBuilder();
+    head.element('retract', attributes: {
+      'id': originalMessageId,
+      'xmlns': 'urn:xmpp:message-retract:1',
     });
-    return builder.buildDocument();
-  }
-
-  /// Helper method to recursively copy XML elements
-  static void _copyElement(XmlBuilder builder, XmlElement element) {
-    builder.element(element.name.local, attributes: {
-      for (final attr in element.attributes) attr.name.local: attr.value,
-    }, nest: () {
-      for (final child in element.children) {
-        if (child is XmlElement) {
-          _copyElement(builder, child);
-        } else if (child is XmlText) {
-          builder.text(child.value);
-        }
-      }
+    head.element('fallback', attributes: {
+      'xmlns': 'urn:xmpp:fallback:0',
+      'for': 'urn:xmpp:message-retract:1',
     });
+    head.element('body', nest: bodyText);
+    root.children.insertAll(
+        0, head.buildFragment().children.map((node) => node.copy()).toList());
+
+    if (includeStoreHint) {
+      final tail = XmlBuilder();
+      tail.element('store', attributes: {'xmlns': 'urn:xmpp:hints'});
+      root.children
+          .addAll(tail.buildFragment().children.map((node) => node.copy()));
+    }
+    return doc;
   }
 }

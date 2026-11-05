@@ -5,7 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.0.6] - 2026-11-05
+## [1.0.7] - 2026-11-05
+
+### Security
+- **TLS certificates were never validated on iOS/macOS**: the stream delegate opted into manual trust evaluation and then accepted every certificate, and `allowSelfSignedCertificates` was never read. GCDAsyncSocket now validates the chain and host name by default; manual (accept-all) evaluation happens only when `allowSelfSignedCertificates: true`, matching Android.
+- **Unescaped text in Web MUC stanzas**: room subject, password, nickname, reason and JIDs were interpolated straight into XML, so a `&` or `<` produced a non-well-formed frame (the server closes the whole stream) and a crafted string could inject stanzas. All web stanzas, including the `<open>` and resource-bind frames, are now built with `XmlBuilder`.
+
+### Fixed
+- **Stream management desync after a raw IQ (Android)**: the 1.0.4 `UnparsedIQ` fallback sent the IQ as a Smack `Nonza`, which XEP-0198 does not count while the server does; the next `<a/>` ack made Smack throw `StreamManagementCounterError` and drop the connection (`connectionLost`) — typically right after an XEP-0363 slot request. Every outgoing stanza is now written verbatim as a counted `Stanza` (`RawStanza`), which also stops `PacketParserUtils` from reordering mixed-content extensions.
+- **Groupchat, error, headline and bare-JID messages never reached Dart (Android)**: incoming messages went through Smack's `ChatManager` (chat/normal with a body from a full JID) plus a namespace allowlist that excluded `groupchat`. One stanza listener now forwards every `<message>`, as iOS/macOS and Web always did; the allowlist is gone.
+- **MUC state and streams were dead on every platform**: `Fxmpp` never fed `MucManager`, so `joinedMucRooms`, `isInMucRoom`, `getMucRoom`, `mucRoomEventStream`, `mucParticipantEventStream` and `mucMessageStream` never changed. Rooms are registered on `joinMucRoom`/`createMucRoom` and updated from incoming presence and messages. `MucManager` also read element text through `XmlElement.value`, which is always `null` in `xml` 7 — body, subject, thread, show and status now use `innerText`.
+- **Native MUC events were discarded (Android, iOS/macOS)**: the `fxmpp/muc_events` listener tested `event is Map<String, dynamic>`, which never matches the `Map<Object?, Object?>` the platform codec produces.
+- **`changeMucSubject` threw `MissingPluginException` on iOS/macOS**: the method was not implemented there.
+- **`joinMucRoom`/`createMucRoom` crashed the app when not connected (iOS/macOS)**: the handlers force-unwrapped the stream on a background queue and mutated room state off the main thread. MUC handlers now run inline (XMPPFramework is already asynchronous) and report `JOIN_MUC_ERROR`/`CREATE_MUC_ERROR` instead. `maxStanzas`/`since` are now honoured on iOS/macOS.
+- **`connect()` resolved before authentication (iOS/macOS)** and the three platforms disagreed on failure: iOS returned `true` immediately, Android threw `PlatformException`, Web returned `false`. `connect()` now resolves `true` only once authenticated and `false` on any failure on every platform; the cause (`error` vs `authenticationFailed`) is reported on `connectionStateStream` by the platform. A failed initial connect on iOS/macOS is reported as `error`, not `connectionLost`.
+- **Duplicate connection states**: `Fxmpp.connect` re-emitted `error` after the platform had already emitted `authenticationFailed` (undoing the 1.0.6 distinction), `Fxmpp.disconnect` re-emitted `disconnected`, and Web emitted `connecting` twice.
+- **Sends reported success while disconnected**: iOS/macOS `sendMessage`/`sendPresence`/`sendIq` returned `true` after XMPPFramework silently dropped the element; Android `sendPresence` did the same with no connection. Both now fail with the platform's `SEND_*_ERROR` code, as Android `sendMessage` always did.
+- **Second `connect()` on Web leaked the previous session**: the old socket stayed bound to the same resource and its subscription kept routing (and, on the server's `<close/>`, disposing the new socket). `connect()` now tears the previous session down first and times out after 30 s like iOS.
+- **`createMucRoom` left the room locked**: Android ignored the built `MucEnterConfiguration` (password dropped) and discarded the creation handle; iOS/macOS and Web never sent the instant-room request. All three now unlock the room (XEP-0045 §10.1.1).
+- **iOS/macOS room delegate methods that never fired**: `muc_message`, `participant_joined`, `participant_left`, `subject_changed` and invitation events used selectors that do not exist in `XMPPRoomDelegate`/`XMPPMUCDelegate`.
+- **Server pings went unanswered on iOS/macOS**: the IQ delegate claimed every IQ as handled, suppressing XMPPFramework's `service-unavailable` reply; servers with ping timeouts killed the session. Unanswered get/set IQs are now bounced as on Android (Smack), and Dart still receives them.
+- **Web `leaveMucRoom` addressed the bare room JID** instead of the occupant JID (XEP-0045 §7.14); the nickname from `joinMucRoom` is now tracked per room.
+- **Re-joining a room stacked duplicate listeners (Android)** so MUC events arrived N times; listeners are attached once per `MultiUserChat` instance.
+- **XEP-0424 builders were not exported** from `package:fxmpp/fxmpp.dart`.
+- **Lossy XML copies**: `Fxmpp.createIq`, `XEP_0184.addReceiptRequestToMessage`, `XEP_0313.createMAMResult` and `XEP_0424.addRetractionToMessage` dropped namespace prefixes (`xml:lang` became `lang`), prefixed elements and CDATA. Nodes are now copied verbatim.
+- **Stanza ids collided**: `generateId` derived its "random" part from the timestamp, so ids built in the same millisecond were identical; ids now carry 32 bits of randomness and all layers share one generator.
+- **Every Web connect threw `RangeError`**: the shared stanza-id generator called `nextInt(1 << 32)`, and on web shifts are 32-bit so the bound evaluated to `0`. The bound is now the literal `0x100000000`.
+- **`dispose()` broke the singleton**: the next native event threw `StateError` on a closed controller; callbacks now ignore closed controllers.
+- **Blocking network I/O on the Android main thread** in `onDetachedFromEngine` (room leave + graceful disconnect, up to the reply timeout each); teardown now runs on a background thread, and the teardown before a reconnect uses `instantShutdown()` instead of waiting for a dead link's closing tag.
+
+### Changed
+- **Android send path**: outgoing stanzas no longer spawn a thread each; they are queued on one executor in call order.
+- **Android logging**: the per-stanza `println` of full XML (twice per stanza) is gone. Dart-side `log()` of every stanza now happens only in debug builds.
+- **iOS/macOS roster module removed**: `XMPPRoster` with a Core Data store was activated on every connect, fetched the whole roster and persisted it, while nothing read it and no roster API exists.
+- **`xml` dependency** widened to `>=6.5.0 <8.0.0` — the 1.0.3 bump to `^7.0.1` was undocumented and nothing in the package needs `xml` 7.
+
 
 ### Fixed
 - **MAM result wrappers never reached Dart (Android)**: XEP-0313 archive pages are delivered as `<message>` wrappers whose only child is `<result xmlns='urn:xmpp:mam:2'>` with the real message nested inside `<forwarded>`. The wrapper has no outer `<body>` and is sent from the bare archive JID, so Smack's `ChatManager` (which requires a body and a full JID) dropped it, and the plugin's own body-less forwarding path only allowed chat-state, receipt, chat-marker and reaction namespaces. Only the closing `<fin>` IQ arrived, so archive catch-up on Android saw zero records. `urn:xmpp:mam:2` is now in that allowlist and the wrapper is forwarded on `messageStream` with its full XML, exactly as on iOS/macOS, which never filtered messages.

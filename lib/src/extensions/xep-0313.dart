@@ -196,8 +196,8 @@ class XEP_0313 {
             'stamp': delayStamp,
           });
 
-          // Add the forwarded message
-          _copyElement(builder, forwardedMessage.rootElement);
+          // Add the forwarded message verbatim
+          builder.xml(forwardedMessage.rootElement.toXmlString());
         });
       });
     });
@@ -423,20 +423,5 @@ class XEP_0313 {
       });
     });
     return builder.buildDocument();
-  }
-
-  /// Helper method to recursively copy XML elements
-  static void _copyElement(XmlBuilder builder, XmlElement element) {
-    builder.element(element.name.local, attributes: {
-      for (final attr in element.attributes) attr.name.local: attr.value,
-    }, nest: () {
-      for (final child in element.children) {
-        if (child is XmlElement) {
-          _copyElement(builder, child);
-        } else if (child is XmlText) {
-          builder.text(child.value);
-        }
-      }
-    });
   }
 }

@@ -22,3 +22,4 @@ export 'src/extensions/xep-0012.dart';
 export 'src/extensions/xep-0085.dart';
 export 'src/extensions/xep-0184.dart';
 export 'src/extensions/xep-0313.dart';
+export 'src/extensions/xep-0424.dart';

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_web_plugins/flutter_web_plugins.dart';
+import 'package:fxmpp/src/core/stanza_id.dart';
 import 'package:fxmpp/src/core/xmpp_connection_config.dart';
 import 'package:fxmpp/src/core/xmpp_connection_state.dart';
 import 'package:xml/xml.dart';
@@ -12,10 +13,17 @@ import 'web/xmpp_websocket.dart';
 
 /// Web implementation of [FxmppPlatform] using XMPP-over-WebSocket (RFC 7395).
 class FxmppWeb extends FxmppPlatform {
+  /// Upper bound for the WebSocket open plus the whole stream negotiation.
+  /// iOS uses the same 30 s for `connect(withTimeout:)`.
+  static const Duration _connectTimeout = Duration(seconds: 30);
+
   XmppWebSocket? _webSocket;
   StreamSubscription<String>? _incomingSubscription;
   XmppConnectionState _connectionState = XmppConnectionState.disconnected;
   String? _fullJid;
+
+  /// Nickname used per joined room (XEP-0045 requires leaving via room/nick).
+  final Map<String, String> _roomNicknames = {};
 
   Function(XmppConnectionState)? _connectionStateCallback;
   Function(XmlDocument)? _messageCallback;
@@ -50,43 +58,48 @@ class FxmppWeb extends FxmppPlatform {
       );
     }
 
+    // Retire any previous session first, as the native platforms do: an
+    // orphaned socket would stay bound to the same resource and its
+    // subscription would keep routing (and closing) into the new session.
+    _cleanup();
+
     try {
       _updateState(XmppConnectionState.connecting);
 
       // Open WebSocket
-      _webSocket = XmppWebSocket();
-      await _webSocket!.connect(wsUrl);
+      final socket = XmppWebSocket();
+      _webSocket = socket;
+      await socket.connect(wsUrl).timeout(_connectTimeout);
 
       // Run XMPP stream negotiation (SASL auth + resource bind)
-      final handler = XmppStreamHandler(_webSocket!, config, _updateState);
-      _fullJid = await handler.negotiate();
+      final handler = XmppStreamHandler(socket, config);
+      _fullJid = await handler.negotiate().timeout(_connectTimeout);
 
       // Negotiation succeeded — set up stanza routing
-      _setupStanzaRouting();
+      _setupStanzaRouting(socket);
       _updateState(XmppConnectionState.connected);
 
       // Send initial presence so the server knows we're online.
       // Native libraries (Smack, XMPPFramework) do this automatically;
       // on web we must do it explicitly or the server won't route
       // incoming stanzas to this resource.
-      _webSocket!.send('<presence xmlns="jabber:client"/>');
+      socket.send('<presence xmlns="jabber:client"/>');
 
       return true;
     } on XmppStreamException catch (e) {
       _updateState(e.state);
-      _webSocket?.dispose();
-      _webSocket = null;
+      _cleanup();
       return false;
     } catch (e) {
+      debugPrint('XMPP connect failed: $e');
       _updateState(XmppConnectionState.error);
-      _webSocket?.dispose();
-      _webSocket = null;
+      _cleanup();
       return false;
     }
   }
 
-  void _setupStanzaRouting() {
-    _incomingSubscription = _webSocket!.incoming.listen(
+  void _setupStanzaRouting(XmppWebSocket socket) {
+    _incomingSubscription = socket.incoming.listen(
       (frame) {
         try {
           final doc = XmlDocument.parse(frame);
@@ -150,6 +163,7 @@ class FxmppWeb extends FxmppPlatform {
     _webSocket?.dispose();
     _webSocket = null;
     _fullJid = null;
+    _roomNicknames.clear();
   }
 
   @override
@@ -213,6 +227,7 @@ class FxmppWeb extends FxmppPlatform {
   //
   // On web, MUC operations are sent as raw XMPP stanzas over the WebSocket.
   // The server handles them identically to stanzas from any XMPP client.
+  // Stanzas are built with XmlBuilder so caller text is always escaped.
   // ============================================================================
 
   @override
@@ -223,25 +238,27 @@ class FxmppWeb extends FxmppPlatform {
     int? maxStanzas,
     DateTime? since,
   }) async {
-    final historyAttrs = <String, String>{};
-    if (maxStanzas != null) historyAttrs['maxstanzas'] = '$maxStanzas';
-    if (since != null) historyAttrs['since'] = since.toUtc().toIso8601String();
-
-    final historyElement = historyAttrs.isEmpty
-        ? ''
-        : '<history${historyAttrs.entries.map((e) => ' ${e.key}="${e.value}"').join()}/>';
-
-    final passwordElement =
-        password != null ? '<password>$password</password>' : '';
-
-    final xml =
-        '<presence to="$roomJid/$nickname" xmlns="jabber:client"'
-        '${_fullJid != null ? ' from="$_fullJid"' : ''}>'
-        '<x xmlns="http://jabber.org/protocol/muc">'
-        '$passwordElement$historyElement'
-        '</x></presence>';
-
-    return _sendRawXml(xml);
+    final sent = _sendStanza(_buildStanza(
+      'presence',
+      attributes: {'to': '$roomJid/$nickname'},
+      nest: (builder) {
+        builder.element('x', attributes: {
+          'xmlns': 'http://jabber.org/protocol/muc',
+        }, nest: () {
+          if (password != null) {
+            builder.element('password', nest: password);
+          }
+          if (maxStanzas != null || since != null) {
+            builder.element('history', attributes: {
+              if (maxStanzas != null) 'maxstanzas': '$maxStanzas',
+              if (since != null) 'since': since.toUtc().toIso8601String(),
+            });
+          }
+        });
+      },
+    ));
+    if (sent) _roomNicknames[roomJid] = nickname;
+    return sent;
   }
 
   @override
@@ -249,17 +266,20 @@ class FxmppWeb extends FxmppPlatform {
     required String roomJid,
     String? reason,
   }) async {
-    // To leave, we need the nickname we used. Extract from presence tracking
-    // or use a generic unavailable presence to the room.
-    final statusElement =
-        reason != null ? '<status>$reason</status>' : '';
-
-    final xml =
-        '<presence to="$roomJid" type="unavailable" xmlns="jabber:client"'
-        '${_fullJid != null ? ' from="$_fullJid"' : ''}>'
-        '$statusElement</presence>';
-
-    return _sendRawXml(xml);
+    // XEP-0045 §7.14: exit by sending unavailable presence to the occupant
+    // JID (room/nick) we joined with.
+    final nickname = _roomNicknames.remove(roomJid);
+    final sent = _sendStanza(_buildStanza(
+      'presence',
+      attributes: {
+        'to': nickname != null ? '$roomJid/$nickname' : roomJid,
+        'type': 'unavailable',
+      },
+      nest: (builder) {
+        if (reason != null) builder.element('status', nest: reason);
+      },
+    ));
+    return sent;
   }
 
   @override
@@ -277,12 +297,11 @@ class FxmppWeb extends FxmppPlatform {
     required String roomJid,
     required String subject,
   }) async {
-    final xml =
-        '<message to="$roomJid" type="groupchat" xmlns="jabber:client"'
-        '${_fullJid != null ? ' from="$_fullJid"' : ''}>'
-        '<subject>$subject</subject></message>';
-
-    return _sendRawXml(xml);
+    return _sendStanza(_buildStanza(
+      'message',
+      attributes: {'to': roomJid, 'type': 'groupchat'},
+      nest: (builder) => builder.element('subject', nest: subject),
+    ));
   }
 
   @override
@@ -382,17 +401,19 @@ class FxmppWeb extends FxmppPlatform {
     required String userJid,
     String? reason,
   }) async {
-    final reasonElement =
-        reason != null ? '<reason>$reason</reason>' : '';
-
-    final xml =
-        '<message to="$roomJid" xmlns="jabber:client"'
-        '${_fullJid != null ? ' from="$_fullJid"' : ''}>'
-        '<x xmlns="http://jabber.org/protocol/muc#user">'
-        '<invite to="$userJid">$reasonElement</invite>'
-        '</x></message>';
-
-    return _sendRawXml(xml);
+    return _sendStanza(_buildStanza(
+      'message',
+      attributes: {'to': roomJid},
+      nest: (builder) {
+        builder.element('x', attributes: {
+          'xmlns': 'http://jabber.org/protocol/muc#user',
+        }, nest: () {
+          builder.element('invite', attributes: {'to': userJid}, nest: () {
+            if (reason != null) builder.element('reason', nest: reason);
+          });
+        });
+      },
+    ));
   }
 
   @override
@@ -401,19 +422,25 @@ class FxmppWeb extends FxmppPlatform {
     String? reason,
     String? alternativeRoom,
   }) async {
-    final reasonElement =
-        reason != null ? '<reason>$reason</reason>' : '';
-    final altRoomAttr =
-        alternativeRoom != null ? ' jid="$alternativeRoom"' : '';
-
-    final xml =
-        '<iq to="$roomJid" type="set" id="destroy_1" xmlns="jabber:client"'
-        '${_fullJid != null ? ' from="$_fullJid"' : ''}>'
-        '<query xmlns="http://jabber.org/protocol/muc#owner">'
-        '<destroy$altRoomAttr>$reasonElement</destroy>'
-        '</query></iq>';
-
-    return _sendRawXml(xml);
+    return _sendStanza(_buildStanza(
+      'iq',
+      attributes: {
+        'to': roomJid,
+        'type': 'set',
+        'id': generateStanzaId('destroy'),
+      },
+      nest: (builder) {
+        builder.element('query', attributes: {
+          'xmlns': 'http://jabber.org/protocol/muc#owner',
+        }, nest: () {
+          builder.element('destroy', attributes: {
+            if (alternativeRoom != null) 'jid': alternativeRoom,
+          }, nest: () {
+            if (reason != null) builder.element('reason', nest: reason);
+          });
+        });
+      },
+    ));
   }
 
   @override
@@ -422,27 +449,53 @@ class FxmppWeb extends FxmppPlatform {
     required String nickname,
     String? password,
   }) async {
-    // Creating a room in XMPP is the same as joining a non-existent room.
-    return joinMucRoom(
+    // Creating a room is joining a non-existent one; the service then creates
+    // it locked (XEP-0045 §10.1.1) until the owner configures it. Request an
+    // instant room right away so other users can join. If the room already
+    // existed and we are not its owner the service just answers an error.
+    final joined = await joinMucRoom(
       roomJid: roomJid,
       nickname: nickname,
       password: password,
     );
+    if (!joined) return false;
+    return _sendStanza(_buildStanza(
+      'iq',
+      attributes: {
+        'to': roomJid,
+        'type': 'set',
+        'id': generateStanzaId('instant'),
+      },
+      nest: (builder) {
+        builder.element('query', attributes: {
+          'xmlns': 'http://jabber.org/protocol/muc#owner',
+        }, nest: () {
+          builder.element('x', attributes: {
+            'xmlns': 'jabber:x:data',
+            'type': 'submit',
+          });
+        });
+      },
+    ));
   }
 
   // ============================================================================
   // Private helpers
   // ============================================================================
 
-  bool _sendRawXml(String xml) {
-    if (_webSocket == null || !_webSocket!.isOpen) return false;
-    try {
-      _webSocket!.send(xml);
-      return true;
-    } catch (e) {
-      debugPrint('Error sending raw XML: $e');
-      return false;
-    }
+  /// Build a `jabber:client` stanza from this session's full JID.
+  XmlDocument _buildStanza(
+    String name, {
+    required Map<String, String> attributes,
+    required void Function(XmlBuilder builder) nest,
+  }) {
+    final builder = XmlBuilder();
+    builder.element(name, attributes: {
+      'xmlns': 'jabber:client',
+      if (_fullJid != null) 'from': _fullJid!,
+      ...attributes,
+    }, nest: () => nest(builder));
+    return builder.buildDocument();
   }
 
   /// Send a MUC admin IQ stanza for role/affiliation changes.
@@ -451,23 +504,22 @@ class FxmppWeb extends FxmppPlatform {
     required Map<String, String> itemAttributes,
     String? reason,
   }) async {
-    final attrs =
-        itemAttributes.entries.map((e) => '${e.key}="${e.value}"').join(' ');
-
-    final String itemElement;
-    if (reason != null) {
-      itemElement = '<item $attrs><reason>$reason</reason></item>';
-    } else {
-      itemElement = '<item $attrs/>';
-    }
-
-    final xml =
-        '<iq to="$roomJid" type="set" id="muc_admin_1" xmlns="jabber:client"'
-        '${_fullJid != null ? ' from="$_fullJid"' : ''}>'
-        '<query xmlns="http://jabber.org/protocol/muc#admin">'
-        '$itemElement'
-        '</query></iq>';
-
-    return _sendRawXml(xml);
+    return _sendStanza(_buildStanza(
+      'iq',
+      attributes: {
+        'to': roomJid,
+        'type': 'set',
+        'id': generateStanzaId('muc_admin'),
+      },
+      nest: (builder) {
+        builder.element('query', attributes: {
+          'xmlns': 'http://jabber.org/protocol/muc#admin',
+        }, nest: () {
+          builder.element('item', attributes: itemAttributes, nest: () {
+            if (reason != null) builder.element('reason', nest: reason);
+          });
+        });
+      },
+    ));
   }
 }

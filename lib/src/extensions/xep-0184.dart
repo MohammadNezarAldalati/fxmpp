@@ -81,39 +81,13 @@ class XEP_0184 {
   /// [messageXml] - The existing message XML document
   /// Returns a new XmlDocument with the receipt request added
   static XmlDocument addReceiptRequestToMessage(XmlDocument messageXml) {
+    // Deep-copy the original message verbatim (prefixes, namespaces and
+    // CDATA included) and append the receipt request.
+    final doc = messageXml.copy();
     final builder = XmlBuilder();
-    final rootElement = messageXml.rootElement;
-
-    // Copy the original message structure
-    builder.element(rootElement.name.local, attributes: {
-      for (final attr in rootElement.attributes) attr.name.local: attr.value,
-    }, nest: () {
-      // Copy all existing child elements
-      for (final child in rootElement.children) {
-        if (child is XmlElement) {
-          _copyElement(builder, child);
-        }
-      }
-      // Add receipt request
-      builder.element('request', attributes: {
-        'xmlns': 'urn:xmpp:receipts',
-      });
-    });
-    return builder.buildDocument();
-  }
-
-  /// Helper method to recursively copy XML elements
-  static void _copyElement(XmlBuilder builder, XmlElement element) {
-    builder.element(element.name.local, attributes: {
-      for (final attr in element.attributes) attr.name.local: attr.value,
-    }, nest: () {
-      for (final child in element.children) {
-        if (child is XmlElement) {
-          _copyElement(builder, child);
-        } else if (child is XmlText) {
-          builder.text(child.value);
-        }
-      }
-    });
+    builder.element('request', attributes: {'xmlns': 'urn:xmpp:receipts'});
+    doc.rootElement.children
+        .addAll(builder.buildFragment().children.map((node) => node.copy()));
+    return doc;
   }
 }

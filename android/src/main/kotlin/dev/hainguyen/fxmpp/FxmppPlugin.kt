@@ -13,23 +13,14 @@ import org.jivesoftware.smack.AbstractXMPPConnection
 import org.jivesoftware.smack.ConnectionConfiguration
 import org.jivesoftware.smack.ConnectionListener
 import org.jivesoftware.smack.SmackException
-import org.jivesoftware.smack.StanzaListener
 import org.jivesoftware.smack.XMPPConnection
 import org.jivesoftware.smack.XMPPException
 import org.jivesoftware.smack.sasl.SASLErrorException
-import org.jivesoftware.smack.util.PacketParserUtils
-import org.jivesoftware.smack.chat2.Chat
-import org.jivesoftware.smack.chat2.ChatManager
-import org.jivesoftware.smack.chat2.IncomingChatMessageListener
-import org.jivesoftware.smack.filter.StanzaTypeFilter
 import org.jivesoftware.smack.packet.IQ
 import org.jivesoftware.smack.packet.Message
-import org.jivesoftware.smack.packet.Nonza
 import org.jivesoftware.smack.packet.Presence
 import org.jivesoftware.smack.packet.Stanza
-import org.jivesoftware.smack.packet.UnparsedIQ
 import org.jivesoftware.smack.packet.XmlEnvironment
-import org.jivesoftware.smack.roster.Roster
 import org.jivesoftware.smack.tcp.XMPPTCPConnection
 import org.jivesoftware.smack.tcp.XMPPTCPConnectionConfiguration
 import org.jxmpp.jid.impl.JidCreate
@@ -37,6 +28,7 @@ import java.io.IOException
 import java.security.cert.X509Certificate
 import javax.net.ssl.X509TrustManager
 import java.util.*
+import java.util.concurrent.Executors
 import org.jivesoftware.smackx.muc.MultiUserChat
 import org.jivesoftware.smackx.muc.MultiUserChatManager
 import org.jivesoftware.smackx.muc.MucEnterConfiguration
@@ -58,28 +50,22 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
     
     private var connectionStateStreamHandler: ConnectionStateStreamHandler? = null
     private var messageStreamHandler: MessageStreamHandler? = null
-
-    // XEP-0085/0184/0333/0444 signaling messages carry no <body>, so Smack's
-// chat2.ChatManager never delivers them to Dart. We forward them ourselves.
-    private val signalingNamespaces = setOf(
-        "http://jabber.org/protocol/chatstates", // XEP-0085 typing
-        "urn:xmpp:receipts",                     // XEP-0184 delivery receipts
-        "urn:xmpp:chat-markers:0",               // XEP-0333 read markers
-        "urn:xmpp:reactions:0",                  // XEP-0444 reactions
-        "urn:xmpp:mam:2"                         // XEP-0313 archive result wrappers
-    )
     private var presenceStreamHandler: PresenceStreamHandler? = null
     private var iqStreamHandler: IqStreamHandler? = null
     private var mucEventStreamHandler: MucEventStreamHandler? = null
     
     private var connection: AbstractXMPPConnection? = null
     private var connectionListener: ConnectionListener? = null
-    private var chatManager: ChatManager? = null
-    private var roster: Roster? = null
     private var mucManager: MultiUserChatManager? = null
     private val joinedRooms = mutableMapOf<String, MultiUserChat>()
+    // MultiUserChatManager caches one MultiUserChat per room JID, so listeners
+    // must be attached once per instance, not once per join.
+    private val listenedRooms = mutableSetOf<MultiUserChat>()
     
     private val mainHandler = Handler(Looper.getMainLooper())
+    // Outgoing stanzas go through one thread so they reach Smack's writer in
+    // call order; sendStanza itself is a non-blocking queue put.
+    private val sendExecutor = Executors.newSingleThreadExecutor()
 
     override fun onAttachedToEngine(@NonNull flutterPluginBinding: FlutterPlugin.FlutterPluginBinding) {
         channel = MethodChannel(flutterPluginBinding.binaryMessenger, "fxmpp")
@@ -111,16 +97,16 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         when (call.method) {
             "connect" -> handleConnect(call, result)
             "disconnect" -> handleDisconnect(result)
-            "sendMessage" -> handleSendMessage(call, result)
-            "sendPresence" -> handleSendPresence(call, result)
-            "sendIq" -> handleSendIq(call, result)
+            "sendMessage" -> handleSendStanza(call, result, "SEND_MESSAGE_ERROR")
+            "sendPresence" -> handleSendStanza(call, result, "SEND_PRESENCE_ERROR")
+            "sendIq" -> handleSendStanza(call, result, "SEND_IQ_ERROR")
             "getConnectionState" -> handleGetConnectionState(result)
             // MUC methods
             "joinMucRoom" -> handleJoinMucRoom(call, result)
             "leaveMucRoom" -> handleLeaveMucRoom(call, result)
             "createMucRoom" -> handleCreateMucRoom(call, result)
-            "sendMucMessage" -> handleSendMucMessage(call, result)
-            "sendMucPrivateMessage" -> handleSendMucPrivateMessage(call, result)
+            "sendMucMessage" -> handleSendStanza(call, result, "SEND_MUC_MESSAGE_ERROR")
+            "sendMucPrivateMessage" -> handleSendStanza(call, result, "SEND_MUC_PRIVATE_MESSAGE_ERROR")
             "changeMucSubject" -> handleChangeMucSubject(call, result)
             "kickMucParticipant" -> handleKickMucParticipant(call, result)
             "banMucUser" -> handleBanMucUser(call, result)
@@ -153,8 +139,9 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         Thread {
             try {
                 // Retire the previous connection unconditionally — see
-                // `teardownConnection`.
-                teardownConnection()
+                // `teardownConnection`. Not graceful: a dead link would make
+                // the closing-tag wait eat the whole reply timeout.
+                teardownConnection(graceful = false)
 
                 val configBuilder = XMPPTCPConnectionConfiguration.builder()
                     .setHost(host)
@@ -186,7 +173,9 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                         mainHandler.post {
                             connectionStateStreamHandler?.sendConnectionState(2) // connected
                         }
-                        setupListeners()
+                        // Listen on the connection we were handed, and only
+                        // once: a stream-management resumption re-enters here.
+                        if (!resumed) setupListeners(connection)
                     }
                     
                     override fun connectionClosed() {
@@ -236,20 +225,26 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
      * makes the server evict whichever of the two is older.
      *
      * Blocks on socket close, so callers must already be off the main thread.
+     *
+     * [graceful] sends `</stream:stream>` and waits (up to the reply timeout)
+     * for the server's closing tag; otherwise the socket is closed at once.
      */
-    private fun teardownConnection() {
+    private fun teardownConnection(graceful: Boolean) {
         val previous = connection ?: return
         // Detach first, so this teardown doesn't surface to Dart as a spurious
         // `disconnected` event mid-reconnect.
         connectionListener?.let { previous.removeConnectionListener(it) }
         connectionListener = null
         connection = null
-        chatManager = null
-        roster = null
         mucManager = null
         joinedRooms.clear()
+        listenedRooms.clear()
         try {
-            previous.disconnect()
+            if (graceful || previous !is XMPPTCPConnection) {
+                previous.disconnect()
+            } else {
+                previous.instantShutdown()
+            }
         } catch (e: Exception) {
             // Best effort: closing an already-broken socket can throw.
         }
@@ -258,7 +253,7 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
     private fun handleDisconnect(result: Result) {
         Thread {
             try {
-                teardownConnection()
+                teardownConnection(graceful = true)
                 mainHandler.post {
                     connectionStateStreamHandler?.sendConnectionState(0) // disconnected
                     result.success(null)
@@ -271,9 +266,20 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         }.start()
     }
     
-    private fun handleSendMessage(call: MethodCall, result: Result) {
+    /**
+     * Writes a Dart-built stanza to the stream verbatim.
+     *
+     * Dart serializes a complete, well-formed stanza, so there is nothing to
+     * gain from re-parsing it into Smack's object model — and plenty to lose:
+     * payloads without an IQProvider were XML-escaped into text (1.0.4), and
+     * extensions with mixed content are reordered by StandardExtensionElement.
+     * [RawStanza] keeps the bytes as they are while still being a Stanza, so
+     * XEP-0198 stream management keeps counting it (a Nonza is not counted and
+     * desynchronises the ack counters, which Smack treats as a stream error).
+     */
+    private fun handleSendStanza(call: MethodCall, result: Result, errorCode: String) {
         val args = call.arguments as? Map<String, Any> ?: run {
-            result.error("INVALID_ARGUMENTS", "Invalid message arguments", null)
+            result.error("INVALID_ARGUMENTS", "Invalid arguments", null)
             return
         }
         
@@ -282,119 +288,24 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
             return
         }
         
-        Thread {
-            try {
-                println("FXMPP: Attempting to send message XML: $xmlString")
-                
-                // Check connection
-                if (connection == null) {
-                    throw Exception("No XMPP connection available")
-                }
-                
-                if (!connection!!.isConnected) {
-                    throw Exception("XMPP connection is not connected")
-                }
-                
-                // Parse XML string to create proper stanza
-                val stanza: Stanza = PacketParserUtils.parseStanza(xmlString)
-                println("FXMPP: Parsed stanza: ${stanza.toXML()}")
-                
-                connection!!.sendStanza(stanza)
-                println("FXMPP: Message sent successfully")
-                
-                mainHandler.post {
-                    result.success(true)
-                }
-            } catch (e: Exception) {
-                println("FXMPP: Error sending message: ${e.message}")
-                e.printStackTrace()
-                mainHandler.post {
-                    result.error("SEND_MESSAGE_ERROR", e.message, null)
-                }
-            }
-        }.start()
-    }
-    
-    private fun handleSendPresence(call: MethodCall, result: Result) {
-        val args = call.arguments as? Map<String, Any> ?: run {
-            result.error("INVALID_ARGUMENTS", "Invalid presence arguments", null)
+        val conn = connection
+        if (conn == null || !conn.isConnected) {
+            result.error(errorCode, "XMPP connection is not connected", null)
             return
         }
         
-        val xmlString = args["xml"] as? String ?: run {
-            result.error("INVALID_ARGUMENTS", "Missing XML content", null)
-            return
-        }
-        
-        Thread {
+        sendExecutor.execute {
             try {
-                // Parse XML string to create proper stanza
-                val stanza: Stanza = PacketParserUtils.parseStanza(xmlString)
-                connection?.sendStanza(stanza)
-                
+                conn.sendStanza(RawStanza(xmlString))
                 mainHandler.post {
                     result.success(true)
                 }
             } catch (e: Exception) {
                 mainHandler.post {
-                    result.error("SEND_PRESENCE_ERROR", e.message, null)
+                    result.error(errorCode, e.message, null)
                 }
             }
-        }.start()
-    }
-    
-    private fun handleSendIq(call: MethodCall, result: Result) {
-        val args = call.arguments as? Map<String, Any> ?: run {
-            result.error("INVALID_ARGUMENTS", "Invalid IQ arguments", null)
-            return
         }
-        
-        val xmlString = args["xml"] as? String ?: run {
-            result.error("INVALID_ARGUMENTS", "Missing XML content", null)
-            return
-        }
-        
-        Thread {
-            try {
-                println("FXMPP: Attempting to send IQ XML: $xmlString")
-                
-                // Check connection
-                if (connection == null) {
-                    throw Exception("No XMPP connection available")
-                }
-                
-                if (!connection!!.isConnected) {
-                    throw Exception("XMPP connection is not connected")
-                }
-                
-                // Parse XML string to create proper stanza
-                val stanza: Stanza = PacketParserUtils.parseStanza(xmlString)
-                println("FXMPP: Parsed IQ stanza: ${stanza.toXML()}")
-
-                if (stanza is UnparsedIQ) {
-                    // No IQProvider is registered for this payload, so Smack fell
-                    // back to UnparsedIQ — which re-serializes the child element by
-                    // XML-*escaping* it into a text node. The payload's attributes
-                    // are silently lost, e.g. an XEP-0363 slot request reaches the
-                    // server as <request/> with no filename/size/content-type and
-                    // no slot is ever granted. Send the caller's XML verbatim.
-                    connection!!.sendNonza(RawXml("iq", xmlString))
-                } else {
-                    connection!!.sendStanza(stanza)
-                }
-                println("FXMPP: IQ sent successfully")
-                
-                mainHandler.post {
-                    result.success(true)
-                }
-            } catch (e: Exception) {
-                println("FXMPP: Error sending IQ: ${e.message}")
-                e.printStackTrace()
-                mainHandler.post {
-                    result.error("SEND_IQ_ERROR", e.message, null)
-                }
-            }
-        }.start()
     }
     
     private fun handleGetConnectionState(result: Result) {
@@ -406,109 +317,35 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         result.success(state)
     }
     
-    private fun setupListeners() {
-        connection?.let { conn ->
-            println("FXMPP: Setting up listeners for connection")
-            println("FXMPP: iqStreamHandler is null: ${iqStreamHandler == null}")
-            
-            // Set up chat manager
-            chatManager = ChatManager.getInstanceFor(conn)
-            chatManager?.addIncomingListener { from, message, chat ->
-                // Send the raw XML of the message
-                val xmlString = message.toXML().toString()
-                val messageMap = mapOf("from" to from, "xml" to xmlString)
-                mainHandler.post {
-                    messageStreamHandler?.sendMessage(messageMap)
+    private fun setupListeners(conn: XMPPConnection) {
+        // One listener for every stanza. Every <message> is forwarded, as on
+        // iOS/macOS and Web: Smack's ChatManager only delivered chat/normal
+        // messages with a <body> from a full JID, which silently dropped MUC
+        // groupchat traffic, error bounces, headlines, server notices and
+        // archive pages. Dart filters what it needs.
+        conn.addAsyncStanzaListener({ stanza ->
+            val xmlString = stanza.toXML().toString()
+            when (stanza) {
+                is Message -> {
+                    val messageMap = mapOf(
+                        "from" to (stanza.from?.toString() ?: ""),
+                        "xml" to xmlString
+                    )
+                    mainHandler.post {
+                        messageStreamHandler?.sendMessage(messageMap)
+                    }
+                }
+                is Presence -> mainHandler.post {
+                    presenceStreamHandler?.sendPresence(xmlString)
+                }
+                is IQ -> mainHandler.post {
+                    iqStreamHandler?.sendIq(xmlString)
                 }
             }
-            
-            // Set up presence listener
-            conn.addAsyncStanzaListener(object : StanzaListener {
-                override fun processStanza(stanza: Stanza) {
-                    if (stanza is Presence) {
-                        // Send the raw XML of the presence
-                        val xmlString = stanza.toXML().toString()
-                        println("FXMPP: Received Presence: $xmlString")
-                        
-                        mainHandler.post {
-                            presenceStreamHandler?.sendPresence(xmlString)
-                        }
-                    }
-                }
-            }, StanzaTypeFilter(Presence::class.java))
-            
-            // Set up IQ listener - listen to ALL stanzas to debug
-            conn.addAsyncStanzaListener(object : StanzaListener {
-                override fun processStanza(stanza: Stanza) {
-                    when (stanza) {
-                        is Message -> {
-                            val xmlString = stanza.toXML().toString()
-                            val messageType = stanza.type?.toString() ?: "normal"
-                            if (messageType == "groupchat") {
-                                println("[XMPP-MUC] <<< Received groupchat message: $xmlString")
-                            } else if (messageType == "chat" && stanza.from?.resourceOrNull != null) {
-                                println("[XMPP-MUC] <<< Received private message: $xmlString")
-                            } else {
-                                println("[XMPP-Message] <<< Received message: $xmlString")
-                            }
-                        }
-                        is IQ -> {
-                            println("[XMPP-IQ] <<< Received IQ stanza: ${stanza.javaClass.simpleName}")
-                        }
-                        is Presence -> {
-                            println("[XMPP-Presence] <<< Received presence: ${stanza.javaClass.simpleName}")
-                        }
-                        else -> {
-                            println("[XMPP] <<< Received stanza type: ${stanza.javaClass.simpleName}")
-                        }
-                    }
-                    if (stanza is IQ) {
-                        // Send the raw XML of the IQ
-                        val xmlString = stanza.toXML().toString()
-                        println("FXMPP: Received IQ: $xmlString")
-                        println("FXMPP: IQ Type: ${stanza.type}, ID: ${stanza.stanzaId}")
-                        
-                        mainHandler.post {
-                            try {
-                                iqStreamHandler?.sendIq(xmlString)
-                                println("FXMPP: IQ sent to Dart successfully")
-                            } catch (e: Exception) {
-                                println("FXMPP: Error sending IQ to Dart: ${e.message}")
-                                e.printStackTrace()
-                            }
-                        }
-                    }
-                    // Body-less signaling messages (typing, delivery receipts,
-                    // read markers, reactions) are dropped by ChatManager, which
-                    // only delivers messages that carry a <body>. Forward them so
-                    // Dart's live-message handler sees them, matching iOS.
-                    // - no-body => never duplicates the body-bearing messages
-                    //   ChatManager already delivers (incl. text carrying <active/>).
-                    // - MAM <result> (urn:xmpp:mam:2) wrappers are body-less too
-                    //   (the body sits inside <forwarded>) and come from the bare
-                    //   archive JID, so ChatManager drops them as well; they must
-                    //   be in the allowlist or archive pages never reach Dart.
-                    if (stanza is Message &&
-                        stanza.type != Message.Type.groupchat &&
-                        stanza.bodies.isEmpty() &&
-                        stanza.extensions.any { it.namespace in signalingNamespaces }
-                    ) {
-                        val fromJid = stanza.from?.toString() ?: ""
-                        val xmlString = stanza.toXML().toString()
-                        val messageMap = mapOf("from" to fromJid, "xml" to xmlString)
-                        mainHandler.post {
-                            messageStreamHandler?.sendMessage(messageMap)
-                        }
-                    }
-                }
-            }, null) // Listen to ALL stanzas for debugging
-            
-            // Set up roster
-            roster = Roster.getInstanceFor(conn)
-            
-            // Set up MUC manager
-            mucManager = MultiUserChatManager.getInstanceFor(conn)
-        }
+        }, null)
+        
+        // Set up MUC manager
+        mucManager = MultiUserChatManager.getInstanceFor(conn)
     }
 
     // ============================================================================
@@ -545,8 +382,8 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                     throw Exception("Failed to get MultiUserChat instance")
                 }
                 
-                // Set up listeners for this room
-                setupMucListeners(muc, roomJid)
+                // Set up listeners for this room (once per cached instance)
+                if (listenedRooms.add(muc)) setupMucListeners(muc, roomJid)
                 
                 // Configure join parameters
                 val enterConfigBuilder = muc.getEnterConfigurationBuilder(resourcepart)
@@ -644,8 +481,8 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                     throw Exception("Failed to get MultiUserChat instance")
                 }
                 
-                // Set up listeners for this room
-                setupMucListeners(muc, roomJid)
+                // Set up listeners for this room (once per cached instance)
+                if (listenedRooms.add(muc)) setupMucListeners(muc, roomJid)
                 
                 // Create and join the room
                 val enterConfigBuilder = muc.getEnterConfigurationBuilder(resourcepart)
@@ -654,7 +491,10 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                 }
                 
                 val enterConfig = enterConfigBuilder.build()
-                muc.create(resourcepart)
+                // A newly created room is locked until its owner configures it
+                // (XEP-0045 §10.1.1); request an instant room so others can
+                // join. createOrJoin returns null when the room already existed.
+                muc.createOrJoin(enterConfig)?.makeInstant()
                 
                 // Store the joined room
                 joinedRooms[roomJid] = muc
@@ -666,68 +506,6 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
             } catch (e: Exception) {
                 mainHandler.post {
                     result.error("CREATE_MUC_ERROR", e.message, null)
-                }
-            }
-        }.start()
-    }
-    
-    private fun handleSendMucMessage(call: MethodCall, result: Result) {
-        val args = call.arguments as? Map<String, Any> ?: run {
-            result.error("INVALID_ARGUMENTS", "Invalid arguments", null)
-            return
-        }
-        
-        val xmlString = args["xml"] as? String ?: run {
-            result.error("INVALID_ARGUMENTS", "Missing xml", null)
-            return
-        }
-        
-        Thread {
-            try {
-                val stanza = PacketParserUtils.parseStanza(xmlString) as Stanza
-                if (stanza is Message) {
-                    connection!!.sendStanza(stanza)
-                    mainHandler.post {
-                        result.success(true)
-                    }
-                } else {
-                    throw Exception("Invalid message stanza")
-                }
-                
-            } catch (e: Exception) {
-                mainHandler.post {
-                    result.error("SEND_MUC_MESSAGE_ERROR", e.message, null)
-                }
-            }
-        }.start()
-    }
-    
-    private fun handleSendMucPrivateMessage(call: MethodCall, result: Result) {
-        val args = call.arguments as? Map<String, Any> ?: run {
-            result.error("INVALID_ARGUMENTS", "Invalid arguments", null)
-            return
-        }
-        
-        val xmlString = args["xml"] as? String ?: run {
-            result.error("INVALID_ARGUMENTS", "Missing xml", null)
-            return
-        }
-        
-        Thread {
-            try {
-                val stanza = PacketParserUtils.parseStanza(xmlString) as Stanza
-                if (stanza is Message) {
-                    connection!!.sendStanza(stanza)
-                    mainHandler.post {
-                        result.success(true)
-                    }
-                } else {
-                    throw Exception("Invalid message stanza")
-                }
-                
-            } catch (e: Exception) {
-                mainHandler.post {
-                    result.error("SEND_MUC_PRIVATE_MESSAGE_ERROR", e.message, null)
                 }
             }
         }.start()
@@ -1363,17 +1141,11 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         iqEventChannel.setStreamHandler(null)
         mucEventChannel.setStreamHandler(null)
         
-        // Leave all joined rooms and disconnect
-        joinedRooms.values.forEach { muc ->
-            try {
-                muc.leave()
-            } catch (e: Exception) {
-                // Ignore errors when leaving rooms during cleanup
-            }
-        }
-        joinedRooms.clear()
-        
-        connection?.disconnect()
+        // Disconnect off the main thread: a graceful close waits for the
+        // server (reply timeout) and closes an SSL socket. The server drops
+        // our room occupancy with the session, so rooms need no explicit leave.
+        Thread { teardownConnection(graceful = true) }.start()
+        sendExecutor.shutdown()
     }
 }
 
@@ -1458,16 +1230,22 @@ class MucEventStreamHandler : EventChannel.StreamHandler {
     }
 }
 
-/// Writes a caller-supplied stanza to the stream byte for byte.
+/// A stanza Smack writes to the stream byte for byte.
 ///
 /// Smack can only re-serialize what it has a provider for; anything else is
-/// mangled on the way out (see [FxmppPlugin.handleSendIq]). A Nonza is just an
-/// Element the connection will write verbatim, which is what we want for XML
-/// that Dart already built correctly.
-class RawXml(private val element: String, private val xml: String) : Nonza {
-    override fun getElementName(): String = element
-    override fun getNamespace(): String = "jabber:client"
-    override fun toXML(xmlEnvironment: XmlEnvironment?): CharSequence = xml
+/// mangled on the way out (see [FxmppPlugin.handleSendStanza]). Unlike a Nonza,
+/// a Stanza is tracked by XEP-0198 stream management, so the server's ack
+/// counters stay in step with Smack's. (AbstractXMPPConnection.sendStanza has a
+/// Java `assert` that the stanza is a Message/Presence/IQ; assertions are
+/// disabled on ART, and the writer only ever calls toXML.)
+class RawStanza(private val xml: String) : Stanza() {
+    /// Root element name (message / presence / iq), read from the XML itself.
+    private val elementName: String =
+        Regex("^\\s*<([^\\s/>]+)").find(xml)?.groupValues?.get(1)?.substringAfter(':') ?: "message"
+
+    override fun getElementName(): String = elementName
+    override fun toXML(enclosingNamespace: XmlEnvironment?): CharSequence = xml
+    override fun toString(): String = xml
 }
 
 // Trust manager for self-signed certificates

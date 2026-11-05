@@ -32,12 +32,17 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     private var mucEventStreamHandler: MucEventStreamHandler?
     
     private var xmppStream: XMPPStream?
-    private var xmppRoster: XMPPRoster?
     private var xmppMUC: XMPPMUC?
     
     private var joinedRooms: [String: XMPPRoom] = [:]
     private var isConnected = false
     private var password: String?
+    private var allowSelfSignedCertificates = false
+    /// The `connect` call still waiting for the outcome of this stream. It is
+    /// settled from the stream delegate (authenticated → `true`, SASL failure →
+    /// `AUTH_FAILED`, socket failure → `CONNECTION_ERROR`) so Dart resolves only
+    /// once the session is usable, exactly as Android does after `login()`.
+    private var pendingConnectResult: FlutterResult?
     
     /// Resolves the binary messenger across platforms: on macOS `messenger` is a
     /// property, on iOS it is a method.
@@ -93,38 +98,40 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         case "disconnect":
             handleDisconnect(result: result)
         case "sendMessage":
-            handleSendMessage(call: call, result: result)
+            handleSendStanza(call: call, result: result, errorCode: "SEND_MESSAGE_ERROR")
         case "sendPresence":
-            handleSendPresence(call: call, result: result)
+            handleSendStanza(call: call, result: result, errorCode: "SEND_PRESENCE_ERROR")
         case "sendIq":
-            handleSendIq(call: call, result: result)
+            handleSendStanza(call: call, result: result, errorCode: "SEND_IQ_ERROR")
         case "getConnectionState":
             handleGetConnectionState(result: result)
         // MUC methods
         case "joinMucRoom":
-            handleJoinMucRoom(call: call, result: result)
+            handleJoinMucRoom(call: call, result: result, errorCode: "JOIN_MUC_ERROR")
         case "leaveMucRoom":
             handleLeaveMucRoom(call: call, result: result)
         case "createMucRoom":
-            handleCreateMucRoom(call: call, result: result)
+            handleJoinMucRoom(call: call, result: result, errorCode: "CREATE_MUC_ERROR")
         case "sendMucMessage":
-            handleSendMucMessage(call: call, result: result)
+            handleSendStanza(call: call, result: result, errorCode: "SEND_MUC_MESSAGE_ERROR")
         case "sendMucPrivateMessage":
-            handleSendMucPrivateMessage(call: call, result: result)
+            handleSendStanza(call: call, result: result, errorCode: "SEND_MUC_PRIVATE_MESSAGE_ERROR")
+        case "changeMucSubject":
+            handleChangeMucSubject(call: call, result: result)
         case "kickMucParticipant":
-            handleKickMucParticipant(call: call, result: result)
+            handleMucRoleChange(call: call, result: result, role: "none")
         case "banMucUser":
-            handleBanMucUser(call: call, result: result)
+            handleMucAffiliationChange(call: call, result: result, affiliation: "outcast")
         case "grantMucVoice":
-            handleGrantMucVoice(call: call, result: result)
+            handleMucRoleChange(call: call, result: result, role: "participant")
         case "revokeMucVoice":
-            handleRevokeMucVoice(call: call, result: result)
+            handleMucRoleChange(call: call, result: result, role: "visitor")
         case "grantMucModerator":
-            handleGrantMucModerator(call: call, result: result)
+            handleMucRoleChange(call: call, result: result, role: "moderator")
         case "grantMucMembership":
-            handleGrantMucMembership(call: call, result: result)
+            handleMucAffiliationChange(call: call, result: result, affiliation: "member")
         case "grantMucAdmin":
-            handleGrantMucAdmin(call: call, result: result)
+            handleMucAffiliationChange(call: call, result: result, affiliation: "admin")
         case "inviteMucUser":
             handleInviteMucUser(call: call, result: result)
         case "destroyMucRoom":
@@ -149,38 +156,48 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         let resource = args["resource"] as? String ?? "fxmpp"
         
         self.password = password
+        self.allowSelfSignedCertificates = args["allowSelfSignedCertificates"] as? Bool ?? false
         
         // Retire the previous stream unconditionally — see `teardownXMPPStream`.
         teardownXMPPStream()
 
-        setupXMPPStream()
+        let stream = setupXMPPStream()
         
-        xmppStream?.hostName = host
-        xmppStream?.hostPort = UInt16(port)
+        stream.hostName = host
+        stream.hostPort = UInt16(port)
         
         guard let jid = XMPPJID(string: "\(username)@\(domain)/\(resource)") else {
             result(FlutterError(code: "INVALID_JID", message: "Invalid JID format", details: nil))
             return
         }
         
-        xmppStream?.myJID = jid
+        stream.myJID = jid
         
         // Configure SSL/TLS
         if useSSL {
-            xmppStream?.startTLSPolicy = .required
+            stream.startTLSPolicy = .required
         } else {
-            xmppStream?.startTLSPolicy = .allowed
+            stream.startTLSPolicy = .allowed
         }
         
         do {
             connectionStateStreamHandler?.sendConnectionState(1) // connecting
-            try xmppStream?.connect(withTimeout: 30.0) // 30 second timeout
-            result(true)
+            try stream.connect(withTimeout: 30.0) // 30 second timeout
+            // `connect(withTimeout:)` only starts the asynchronous socket
+            // connect; the outcome arrives through the stream delegate.
+            pendingConnectResult = result
         } catch let error {
             debugPrint("Connection error: \(error.localizedDescription)")
             connectionStateStreamHandler?.sendConnectionState(4) // error
             result(FlutterError(code: "CONNECTION_ERROR", message: error.localizedDescription, details: nil))
         }
+    }
+    
+    /// Settles the `connect` call that is waiting for this stream, if any.
+    private func settlePendingConnect(_ error: FlutterError?) {
+        guard let pending = pendingConnectResult else { return }
+        pendingConnectResult = nil
+        pending(error ?? true)
     }
     
     private func handleDisconnect(result: @escaping FlutterResult) {
@@ -189,49 +206,24 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         result(nil)
     }
     
-    private func handleSendMessage(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    /// Sends a Dart-built stanza verbatim. Fails like Android does when there
+    /// is no authenticated session: `XMPPStream.send` would silently drop the
+    /// element while the caller was told it was sent.
+    private func handleSendStanza(call: FlutterMethodCall, result: @escaping FlutterResult, errorCode: String) {
         guard let args = call.arguments as? [String: Any],
               let xmlString = args["xml"] as? String else {
             result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing XML content", details: nil))
             return
         }
         
-        do {
-            let xmlElement = try XMPPXMLElement(xmlString: xmlString)
-            xmppStream?.send(xmlElement)
-            result(true)
-        } catch {
-            result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML: \(error.localizedDescription)", details: nil))
-        }
-    }
-    
-    private func handleSendPresence(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let xmlString = args["xml"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing XML content", details: nil))
+        guard let stream = xmppStream, isConnected else {
+            result(FlutterError(code: errorCode, message: "XMPP connection is not connected", details: nil))
             return
         }
         
         do {
             let xmlElement = try XMPPXMLElement(xmlString: xmlString)
-            xmppStream?.send(xmlElement)
-            result(true)
-        } catch {
-            result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML: \(error.localizedDescription)", details: nil))
-        }
-    }
-    
-    private func handleSendIq(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let xmlString = args["xml"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing XML content", details: nil))
-            return
-        }
-        
-        do {
-            let xmlElement = try XMPPXMLElement(xmlString: xmlString)
-            xmppStream?.send(xmlElement)
-            debugPrint("send xmlElement \(xmlElement)")
+            stream.send(xmlElement)
             result(true)
         } catch {
             result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML: \(error.localizedDescription)", details: nil))
@@ -248,18 +240,17 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         }
     }
     
-    private func setupXMPPStream() {
-        xmppStream = XMPPStream()
-        xmppStream?.addDelegate(self, delegateQueue: DispatchQueue.main)
+    private func setupXMPPStream() -> XMPPStream {
+        let stream = XMPPStream()
+        stream.addDelegate(self, delegateQueue: DispatchQueue.main)
         
         // Background sockets are an iOS-only (and deprecated) API, absent on macOS.
         #if os(iOS)
-        xmppStream?.enableBackgroundingOnSocket = true
+        stream.enableBackgroundingOnSocket = true
         #endif
         
-        xmppRoster = XMPPRoster(rosterStorage: XMPPRosterCoreDataStorage.sharedInstance())
-        xmppRoster?.activate(xmppStream!)
-        xmppRoster?.addDelegate(self, delegateQueue: DispatchQueue.main)
+        // No XMPPRoster: the plugin exposes no roster API, and the module would
+        // fetch the whole roster into a Core Data store on every login.
 
         // No XMPPReconnect here on purpose: reconnection is the Dart caller's
         // job. A native reconnector redialing the same account behind Dart's
@@ -268,9 +259,13 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         // kick-each-other loop.
 
         // Setup MUC
-        xmppMUC = XMPPMUC()
-        xmppMUC?.activate(xmppStream!)
-        xmppMUC?.addDelegate(self, delegateQueue: DispatchQueue.main)
+        let muc = XMPPMUC()
+        muc.activate(stream)
+        muc.addDelegate(self, delegateQueue: DispatchQueue.main)
+        xmppMUC = muc
+        
+        xmppStream = stream
+        return stream
     }
 
     /// Dismantles the current stream and its modules.
@@ -281,6 +276,8 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     /// connection-state events into the single event channel and could still be
     /// logged in under the same resource as the live session.
     private func teardownXMPPStream() {
+        settlePendingConnect(FlutterError(code: "CONNECTION_ERROR", message: "Connection cancelled", details: nil))
+        
         for room in joinedRooms.values {
             room.removeDelegate(self)
             room.deactivate()
@@ -290,10 +287,6 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         xmppMUC?.removeDelegate(self)
         xmppMUC?.deactivate()
         xmppMUC = nil
-
-        xmppRoster?.removeDelegate(self)
-        xmppRoster?.deactivate()
-        xmppRoster = nil
 
         // Drop the delegate before disconnecting so this teardown doesn't surface
         // to Dart as a spurious `disconnected`/`connectionLost` event.
@@ -313,8 +306,39 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
     }
 
     // MARK: - MUC Method Handlers
+    //
+    // Everything XMPPFramework does here (`send`, `join`, `leave`, `inviteUser`)
+    // is already asynchronous on its own queues, so the handlers run inline on
+    // the platform thread; that also keeps `joinedRooms` single-threaded.
     
-    private func handleJoinMucRoom(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    /// The joined room for [roomJid], or reports ROOM_NOT_FOUND and returns nil.
+    private func joinedRoom(_ roomJid: String, result: @escaping FlutterResult) -> XMPPRoom? {
+        guard let room = joinedRooms[roomJid] else {
+            result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
+            return nil
+        }
+        return room
+    }
+    
+    /// `<history maxstanzas='N' since='...'/>` from the Dart join parameters.
+    private func historyElement(from args: [String: Any]) -> XMPPXMLElement? {
+        let maxStanzas = args["maxStanzas"] as? Int
+        let since = args["since"] as? Int // millisecondsSinceEpoch
+        if maxStanzas == nil && since == nil { return nil }
+        let history = XMPPXMLElement(name: "history")
+        if let maxStanzas = maxStanzas {
+            history.addAttribute(withName: "maxstanzas", stringValue: String(maxStanzas))
+        }
+        if let since = since {
+            let date = Date(timeIntervalSince1970: Double(since) / 1000)
+            history.addAttribute(withName: "since", stringValue: ISO8601DateFormatter().string(from: date))
+        }
+        return history
+    }
+    
+    /// Joins (or creates: XEP-0045 creation is joining a room that does not
+    /// exist yet; `xmppRoomDidCreate` then unlocks it).
+    private func handleJoinMucRoom(call: FlutterMethodCall, result: @escaping FlutterResult, errorCode: String) {
         guard let args = call.arguments as? [String: Any],
               let roomJid = args["roomJid"] as? String,
               let nickname = args["nickname"] as? String else {
@@ -324,36 +348,29 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         
         let password = args["password"] as? String
         
-        DispatchQueue.global(qos: .background).async {
-            do {
-                guard let roomJidObj = XMPPJID(string: roomJid) else {
-                    DispatchQueue.main.async {
-                        result(FlutterError(code: "INVALID_JID", message: "Invalid room JID", details: nil))
-                    }
-                    return
-                }
-                
-                let room = XMPPRoom(roomStorage: XMPPRoomMemoryStorage(), jid: roomJidObj, dispatchQueue: DispatchQueue.main)
-                room.activate(self.xmppStream!)
-                room.addDelegate(self, delegateQueue: DispatchQueue.main)
-                
-                if let password = password {
-                    try room.join(usingNickname: nickname, history: nil, password: password)
-                } else {
-                    try room.join(usingNickname: nickname, history: nil)
-                }
-                
-                self.joinedRooms[roomJid] = room
-                
-                DispatchQueue.main.async {
-                    result(true)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "JOIN_MUC_ERROR", message: error.localizedDescription, details: nil))
-                }
-            }
+        guard let stream = xmppStream, isConnected else {
+            result(FlutterError(code: errorCode, message: "XMPP connection is not connected", details: nil))
+            return
         }
+        
+        guard let roomJidObj = XMPPJID(string: roomJid) else {
+            result(FlutterError(code: "INVALID_JID", message: "Invalid room JID", details: nil))
+            return
+        }
+        
+        // Re-joining replaces the previous XMPPRoom so delegates are not doubled.
+        if let previous = joinedRooms[roomJid] {
+            previous.removeDelegate(self)
+            previous.deactivate()
+        }
+        
+        let room = XMPPRoom(roomStorage: XMPPRoomMemoryStorage(), jid: roomJidObj, dispatchQueue: DispatchQueue.main)
+        room.activate(stream)
+        room.addDelegate(self, delegateQueue: DispatchQueue.main)
+        room.join(usingNickname: nickname, history: historyElement(from: args), password: password)
+        
+        joinedRooms[roomJid] = room
+        result(true)
     }
     
     private func handleLeaveMucRoom(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -363,25 +380,32 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
             return
         }
         
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            room.leave()
-            room.deactivate()
-            self.joinedRooms.removeValue(forKey: roomJid)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
+        guard let room = joinedRoom(roomJid, result: result) else { return }
+        
+        room.leave()
+        room.removeDelegate(self)
+        room.deactivate()
+        joinedRooms.removeValue(forKey: roomJid)
+        
+        result(true)
     }
     
-    private func handleCreateMucRoom(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    private func handleChangeMucSubject(call: FlutterMethodCall, result: @escaping FlutterResult) {
+        guard let args = call.arguments as? [String: Any],
+              let roomJid = args["roomJid"] as? String,
+              let subject = args["subject"] as? String else {
+            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
+            return
+        }
+        
+        guard let room = joinedRoom(roomJid, result: result) else { return }
+        
+        room.changeSubject(subject)
+        result(true)
+    }
+    
+    /// kick / grant voice / revoke voice / grant moderator: `<item nick role/>`.
+    private func handleMucRoleChange(call: FlutterMethodCall, result: @escaping FlutterResult, role: String) {
         guard let args = call.arguments as? [String: Any],
               let roomJid = args["roomJid"] as? String,
               let nickname = args["nickname"] as? String else {
@@ -389,129 +413,12 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
             return
         }
         
-        let password = args["password"] as? String
-        
-        DispatchQueue.global(qos: .background).async {
-            do {
-                guard let roomJidObj = XMPPJID(string: roomJid) else {
-                    DispatchQueue.main.async {
-                        result(FlutterError(code: "INVALID_JID", message: "Invalid room JID", details: nil))
-                    }
-                    return
-                }
-                
-                let room = XMPPRoom(roomStorage: XMPPRoomMemoryStorage(), jid: roomJidObj, dispatchQueue: DispatchQueue.main)
-                room.activate(self.xmppStream!)
-                room.addDelegate(self, delegateQueue: DispatchQueue.main)
-                
-                if let password = password {
-                    try room.join(usingNickname: nickname, history: nil, password: password)
-                } else {
-                    try room.join(usingNickname: nickname, history: nil)
-                }
-                
-                self.joinedRooms[roomJid] = room
-                
-                DispatchQueue.main.async {
-                    result(true)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "CREATE_MUC_ERROR", message: error.localizedDescription, details: nil))
-                }
-            }
-        }
+        sendMucAdminIQ(roomJid: roomJid, item: ["nick": nickname, "role": role],
+                       reason: args["reason"] as? String, result: result)
     }
     
-    private func handleSendMucMessage(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let xmlString = args["xml"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing xml argument", details: nil))
-            return
-        }
-        
-        DispatchQueue.global(qos: .background).async {
-            do {
-                guard let rootElement = try? XMPPXMLElement(xmlString: xmlString) else {
-                    DispatchQueue.main.async {
-                        result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML", details: nil))
-                    }
-                    return
-                }
-                
-                let xmppMessage = XMPPMessage(from: rootElement)
-                self.xmppStream?.send(xmppMessage)
-                
-                DispatchQueue.main.async {
-                    result(true)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "SEND_MUC_MESSAGE_ERROR", message: error.localizedDescription, details: nil))
-                }
-            }
-        }
-    }
-    
-    private func handleSendMucPrivateMessage(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let xmlString = args["xml"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing xml argument", details: nil))
-            return
-        }
-        
-        DispatchQueue.global(qos: .background).async {
-            do {
-                guard let rootElement = try? XMPPXMLElement(xmlString: xmlString) else {
-                    DispatchQueue.main.async {
-                        result(FlutterError(code: "XML_PARSE_ERROR", message: "Failed to parse XML", details: nil))
-                    }
-                    return
-                }
-                
-                let xmppMessage = XMPPMessage(from: rootElement)
-                self.xmppStream?.send(xmppMessage)
-                
-                DispatchQueue.main.async {
-                    result(true)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "SEND_MUC_PRIVATE_MESSAGE_ERROR", message: error.localizedDescription, details: nil))
-                }
-            }
-        }
-    }
-    
-    private func handleKickMucParticipant(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let roomJid = args["roomJid"] as? String,
-              let nickname = args["nickname"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
-            return
-        }
-        
-        let reason = args["reason"] as? String
-        
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct kick method, send IQ manually
-            let kickIQ = self.createKickIQ(roomJid: roomJid, nickname: nickname, reason: reason)
-            self.xmppStream?.send(kickIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
-    }
-    
-    private func handleBanMucUser(call: FlutterMethodCall, result: @escaping FlutterResult) {
+    /// ban / grant membership / grant admin: `<item jid affiliation/>`.
+    private func handleMucAffiliationChange(call: FlutterMethodCall, result: @escaping FlutterResult, affiliation: String) {
         guard let args = call.arguments as? [String: Any],
               let roomJid = args["roomJid"] as? String,
               let userJid = args["userJid"] as? String else {
@@ -519,175 +426,34 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
             return
         }
         
-        let reason = args["reason"] as? String
-        
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            guard let jid = XMPPJID(string: userJid) else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "INVALID_JID", message: "Invalid user JID", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct ban method, send IQ manually
-            let banIQ = self.createBanIQ(roomJid: roomJid, userJid: userJid, reason: reason)
-            self.xmppStream?.send(banIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
-    }
-    
-    private func handleGrantMucVoice(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let roomJid = args["roomJid"] as? String,
-              let nickname = args["nickname"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
+        guard XMPPJID(string: userJid) != nil else {
+            result(FlutterError(code: "INVALID_JID", message: "Invalid user JID", details: nil))
             return
         }
         
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct grantVoice method, send IQ manually
-            let voiceIQ = self.createGrantVoiceIQ(roomJid: roomJid, nickname: nickname)
-            self.xmppStream?.send(voiceIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
+        sendMucAdminIQ(roomJid: roomJid, item: ["jid": userJid, "affiliation": affiliation],
+                       reason: args["reason"] as? String, result: result)
     }
     
-    private func handleRevokeMucVoice(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let roomJid = args["roomJid"] as? String,
-              let nickname = args["nickname"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
-            return
-        }
+    /// XMPPFramework's `editRoomPrivileges:` keys items by JID only, so the
+    /// nick-addressed role changes are sent as a muc#admin IQ built here.
+    private func sendMucAdminIQ(roomJid: String, item: [String: String], reason: String?, result: @escaping FlutterResult) {
+        guard joinedRoom(roomJid, result: result) != nil, let stream = xmppStream else { return }
         
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct revokeVoice method, send IQ manually
-            let revokeVoiceIQ = self.createRevokeVoiceIQ(roomJid: roomJid, nickname: nickname)
-            self.xmppStream?.send(revokeVoiceIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
+        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
+        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
+        let itemElement = XMPPXMLElement(name: "item")
+        for (name, value) in item {
+            itemElement.addAttribute(withName: name, stringValue: value)
         }
-    }
-    
-    private func handleGrantMucModerator(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let roomJid = args["roomJid"] as? String,
-              let nickname = args["nickname"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
-            return
+        if let reason = reason {
+            itemElement.addChild(XMPPXMLElement(name: "reason", stringValue: reason))
         }
+        query.addChild(itemElement)
+        iq.addChild(query)
+        stream.send(iq)
         
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct grantModerator method, send IQ manually
-            let moderatorIQ = self.createGrantModeratorIQ(roomJid: roomJid, nickname: nickname)
-            self.xmppStream?.send(moderatorIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
-    }
-    
-    private func handleGrantMucMembership(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let roomJid = args["roomJid"] as? String,
-              let userJid = args["userJid"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
-            return
-        }
-        
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            guard let jid = XMPPJID(string: userJid) else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "INVALID_JID", message: "Invalid user JID", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct grantMembership method, send IQ manually
-            let membershipIQ = self.createGrantMembershipIQ(roomJid: roomJid, userJid: userJid)
-            self.xmppStream?.send(membershipIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
-    }
-    
-    private func handleGrantMucAdmin(call: FlutterMethodCall, result: @escaping FlutterResult) {
-        guard let args = call.arguments as? [String: Any],
-              let roomJid = args["roomJid"] as? String,
-              let userJid = args["userJid"] as? String else {
-            result(FlutterError(code: "INVALID_ARGUMENTS", message: "Missing required arguments", details: nil))
-            return
-        }
-        
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            guard let jid = XMPPJID(string: userJid) else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "INVALID_JID", message: "Invalid user JID", details: nil))
-                }
-                return
-            }
-            
-            // XMPPFramework doesn't have direct grantAdmin method, send IQ manually
-            let adminIQ = self.createGrantAdminIQ(roomJid: roomJid, userJid: userJid)
-            self.xmppStream?.send(adminIQ)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
+        result(true)
     }
     
     private func handleInviteMucUser(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -700,27 +466,15 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         
         let reason = args["reason"] as? String ?? ""
         
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            guard let jid = XMPPJID(string: userJid) else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "INVALID_JID", message: "Invalid user JID", details: nil))
-                }
-                return
-            }
-            
-            room.inviteUser(jid, withMessage: reason)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
+        guard let room = joinedRoom(roomJid, result: result) else { return }
+        
+        guard let jid = XMPPJID(string: userJid) else {
+            result(FlutterError(code: "INVALID_JID", message: "Invalid user JID", details: nil))
+            return
         }
+        
+        room.inviteUser(jid, withMessage: reason)
+        result(true)
     }
     
     private func handleDestroyMucRoom(call: FlutterMethodCall, result: @escaping FlutterResult) {
@@ -733,118 +487,10 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
         let reason = args["reason"] as? String
         let alternativeRoom = args["alternativeRoom"] as? String
         
-        DispatchQueue.global(qos: .background).async {
-            guard let room = self.joinedRooms[roomJid] else {
-                DispatchQueue.main.async {
-                    result(FlutterError(code: "ROOM_NOT_FOUND", message: "Room not joined", details: nil))
-                }
-                return
-            }
-            
-            var alternativeJid: XMPPJID? = nil
-            if let altRoom = alternativeRoom {
-                alternativeJid = XMPPJID(string: altRoom)
-            }
-            
-            // XMPPFramework doesn't have direct destroyRoom method, send IQ manually
-            let destroyIQ = self.createDestroyRoomIQ(roomJid: roomJid, alternativeRoom: alternativeRoom, reason: reason)
-            self.xmppStream?.send(destroyIQ)
-            self.joinedRooms.removeValue(forKey: roomJid)
-            
-            DispatchQueue.main.async {
-                result(true)
-            }
-        }
-    }
-    
-    // MARK: - Helper Methods for MUC IQ Creation
-    
-    private func createKickIQ(roomJid: String, nickname: String, reason: String?) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "nick", stringValue: nickname)
-        item.addAttribute(withName: "role", stringValue: "none")
-        if let reason = reason {
-            let reasonElement = XMPPXMLElement(name: "reason", stringValue: reason)
-            item.addChild(reasonElement)
-        }
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createBanIQ(roomJid: String, userJid: String, reason: String?) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "jid", stringValue: userJid)
-        item.addAttribute(withName: "affiliation", stringValue: "outcast")
-        if let reason = reason {
-            let reasonElement = XMPPXMLElement(name: "reason", stringValue: reason)
-            item.addChild(reasonElement)
-        }
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createGrantVoiceIQ(roomJid: String, nickname: String) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "nick", stringValue: nickname)
-        item.addAttribute(withName: "role", stringValue: "participant")
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createRevokeVoiceIQ(roomJid: String, nickname: String) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "nick", stringValue: nickname)
-        item.addAttribute(withName: "role", stringValue: "visitor")
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createGrantModeratorIQ(roomJid: String, nickname: String) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "nick", stringValue: nickname)
-        item.addAttribute(withName: "role", stringValue: "moderator")
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createGrantMembershipIQ(roomJid: String, userJid: String) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "jid", stringValue: userJid)
-        item.addAttribute(withName: "affiliation", stringValue: "member")
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createGrantAdminIQ(roomJid: String, userJid: String) -> XMPPIQ {
-        let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
-        let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#admin")
-        let item = XMPPXMLElement(name: "item")
-        item.addAttribute(withName: "jid", stringValue: userJid)
-        item.addAttribute(withName: "affiliation", stringValue: "admin")
-        query.addChild(item)
-        iq.addChild(query)
-        return iq
-    }
-    
-    private func createDestroyRoomIQ(roomJid: String, alternativeRoom: String?, reason: String?) -> XMPPIQ {
+        guard let room = joinedRoom(roomJid, result: result), let stream = xmppStream else { return }
+        
+        // XMPPRoom.destroyRoom takes no alternative room or reason, so the
+        // muc#owner IQ is built here.
         let iq = XMPPIQ(type: "set", to: XMPPJID(string: roomJid))
         let query = XMPPXMLElement(name: "query", xmlns: "http://jabber.org/protocol/muc#owner")
         let destroy = XMPPXMLElement(name: "destroy")
@@ -852,23 +498,35 @@ public class FxmppPlugin: NSObject, FlutterPlugin {
             destroy.addAttribute(withName: "jid", stringValue: altRoom)
         }
         if let reason = reason {
-            let reasonElement = XMPPXMLElement(name: "reason", stringValue: reason)
-            destroy.addChild(reasonElement)
+            destroy.addChild(XMPPXMLElement(name: "reason", stringValue: reason))
         }
         query.addChild(destroy)
         iq.addChild(query)
-        return iq
+        stream.send(iq)
+        
+        room.removeDelegate(self)
+        room.deactivate()
+        joinedRooms.removeValue(forKey: roomJid)
+        
+        result(true)
     }
 }
 
 // MARK: - XMPPStreamDelegate
 extension FxmppPlugin: XMPPStreamDelegate {
     public func xmppStream(_ sender: XMPPStream, didReceive trust: SecTrust, completionHandler: @escaping (Bool) -> Void) {
-        completionHandler(true)
+        // Only reached when `willSecureWithSettings` opted into manual trust
+        // evaluation, i.e. when the caller allowed self-signed certificates.
+        completionHandler(allowSelfSignedCertificates)
     }
     
     public func xmppStream(_ sender: XMPPStream, willSecureWithSettings settings: NSMutableDictionary) {
-        settings.setValue(true, forKey: GCDAsyncSocketManuallyEvaluateTrust)
+        // Default: GCDAsyncSocket validates the certificate chain and host name
+        // itself. Manual evaluation (accept anything) only on explicit opt-in,
+        // matching Android's AcceptAllTrustManager.
+        if allowSelfSignedCertificates {
+            settings.setValue(true, forKey: GCDAsyncSocketManuallyEvaluateTrust)
+        }
     }
     
     public func xmppStreamDidConnect(_ sender: XMPPStream) {
@@ -878,6 +536,7 @@ extension FxmppPlugin: XMPPStreamDelegate {
         } catch let error {
             debugPrint("Authentication error: \(error.localizedDescription)")
             connectionStateStreamHandler?.sendConnectionState(4) // error
+            settlePendingConnect(FlutterError(code: "CONNECTION_ERROR", message: error.localizedDescription, details: nil))
         }
     }
 
@@ -889,18 +548,28 @@ extension FxmppPlugin: XMPPStreamDelegate {
         // Send initial presence
         let presence = XMPPPresence()
         sender.send(presence)
+        
+        settlePendingConnect(nil)
     }
 
     public func xmppStream(_ sender: XMPPStream, didNotAuthenticate error: XMPPXMLElement) {
         guard isCurrent(sender) else { return }
         debugPrint("XMPP stream authentication failed: \(error)")
         connectionStateStreamHandler?.sendConnectionState(5) // authentication failed
+        settlePendingConnect(FlutterError(code: "AUTH_FAILED", message: error.xmlString, details: nil))
     }
 
     public func xmppStreamDidDisconnect(_ sender: XMPPStream, withError error: Error?) {
         guard isCurrent(sender) else { return }
         debugPrint("XMPP stream disconnected with error: \(error?.localizedDescription ?? "No error")")
         isConnected = false
+        if pendingConnectResult != nil {
+            // The stream never authenticated: a failed connect (unreachable host,
+            // timeout), not a lost session — `error`, as on Android.
+            connectionStateStreamHandler?.sendConnectionState(4) // error
+            settlePendingConnect(FlutterError(code: "CONNECTION_ERROR", message: error?.localizedDescription ?? "Connection failed", details: nil))
+            return
+        }
         if let error = error {
             debugPrint("Disconnect error details: \(error)")
             connectionStateStreamHandler?.sendConnectionState(6) // connection lost
@@ -935,18 +604,38 @@ extension FxmppPlugin: XMPPStreamDelegate {
         let xmlString = iq.xmlString
         iqStreamHandler?.sendIq(xmlString)
         
-        return true
+        // `false`: no native code answers this IQ, so XMPPFramework replies
+        // with `service-unavailable` to unanswered get/set requests (RFC 6120
+        // §8.2.3) — which is what Smack does on Android. Returning `true`
+        // suppressed that, so server pings went unanswered and the session
+        // was killed. Dart still receives the IQ and may answer it itself.
+        return false
     }
-}
-
-// MARK: - XMPPRosterDelegate
-extension FxmppPlugin: XMPPRosterDelegate {
-    // Implement roster delegate methods as needed
 }
 
 // MARK: - XMPPMUCDelegate
 extension FxmppPlugin: XMPPMUCDelegate {
-    // Implement MUC delegate methods as needed
+    @objc(xmppMUC:roomJID:didReceiveInvitation:)
+    public func xmppMUC(_ sender: XMPPMUC, roomJID: XMPPJID, didReceiveInvitation message: XMPPMessage) {
+        let event: [String: Any] = [
+            "type": "room_invitation",
+            "roomJid": roomJID.bare,
+            "from": message.from?.full ?? "",
+            "reason": message.body ?? ""
+        ]
+        mucEventStreamHandler?.sendEvent(event)
+    }
+    
+    @objc(xmppMUC:roomJID:didReceiveInvitationDecline:)
+    public func xmppMUC(_ sender: XMPPMUC, roomJID: XMPPJID, didReceiveInvitationDecline message: XMPPMessage) {
+        let event: [String: Any] = [
+            "type": "invitation_declined",
+            "roomJid": roomJID.bare,
+            "from": message.from?.full ?? "",
+            "reason": message.body ?? ""
+        ]
+        mucEventStreamHandler?.sendEvent(event)
+    }
 }
 
 // MARK: - XMPPRoomDelegate
@@ -967,18 +656,20 @@ extension FxmppPlugin: XMPPRoomDelegate {
         mucEventStreamHandler?.sendEvent(event)
     }
     
-    public func xmppRoom(_ sender: XMPPRoom, didReceiveMessage message: XMPPMessage) {
+    @objc(xmppRoom:didReceiveMessage:fromOccupant:)
+    public func xmppRoom(_ sender: XMPPRoom, didReceive message: XMPPMessage, fromOccupant occupantJID: XMPPJID) {
         let event: [String: Any] = [
             "type": "muc_message",
             "roomJid": sender.roomJID.bare,
-            "from": message.from?.full ?? "",
+            "from": occupantJID.full,
             "body": message.body ?? "",
             "messageType": message.type ?? "groupchat"
         ]
         mucEventStreamHandler?.sendEvent(event)
     }
     
-    public func xmppRoom(_ sender: XMPPRoom, occupantDidJoin occupantJID: XMPPJID) {
+    @objc(xmppRoom:occupantDidJoin:withPresence:)
+    public func xmppRoom(_ sender: XMPPRoom, occupantDidJoin occupantJID: XMPPJID, with presence: XMPPPresence) {
         let event: [String: Any] = [
             "type": "participant_joined",
             "roomJid": sender.roomJID.bare,
@@ -987,7 +678,8 @@ extension FxmppPlugin: XMPPRoomDelegate {
         mucEventStreamHandler?.sendEvent(event)
     }
     
-    public func xmppRoom(_ sender: XMPPRoom, occupantDidLeave occupantJID: XMPPJID) {
+    @objc(xmppRoom:occupantDidLeave:withPresence:)
+    public func xmppRoom(_ sender: XMPPRoom, occupantDidLeave occupantJID: XMPPJID, with presence: XMPPPresence) {
         let event: [String: Any] = [
             "type": "participant_left",
             "roomJid": sender.roomJID.bare,
@@ -1006,27 +698,12 @@ extension FxmppPlugin: XMPPRoomDelegate {
         mucEventStreamHandler?.sendEvent(event)
     }
     
-    public func xmppRoom(_ sender: XMPPRoom, didReceiveInvitation message: XMPPMessage) {
-        let event: [String: Any] = [
-            "type": "room_invitation",
-            "roomJid": sender.roomJID.bare,
-            "from": message.from?.full ?? "",
-            "reason": message.body ?? ""
-        ]
-        mucEventStreamHandler?.sendEvent(event)
-    }
-    
-    public func xmppRoom(_ sender: XMPPRoom, didReceiveInvitationDecline message: XMPPMessage) {
-        let event: [String: Any] = [
-            "type": "invitation_declined",
-            "roomJid": sender.roomJID.bare,
-            "from": message.from?.full ?? "",
-            "reason": message.body ?? ""
-        ]
-        mucEventStreamHandler?.sendEvent(event)
-    }
-    
     public func xmppRoomDidCreate(_ sender: XMPPRoom) {
+        // A freshly created room is locked until its owner configures it
+        // (XEP-0045 §10.1.1). Request the instant (default) configuration so
+        // other users can join, as Android does with makeInstant().
+        sender.configureRoom(usingOptions: nil)
+        
         let event: [String: Any] = [
             "type": "room_created",
             "roomJid": sender.roomJID.bare
@@ -1042,11 +719,12 @@ extension FxmppPlugin: XMPPRoomDelegate {
         mucEventStreamHandler?.sendEvent(event)
     }
     
-    public func xmppRoom(_ sender: XMPPRoom, didChangeSubject subject: String?) {
+    @objc(xmppRoomDidChangeSubject:)
+    public func xmppRoomDidChangeSubject(_ sender: XMPPRoom) {
         let event: [String: Any] = [
             "type": "subject_changed",
             "roomJid": sender.roomJID.bare,
-            "subject": subject ?? ""
+            "subject": sender.roomSubject ?? ""
         ]
         mucEventStreamHandler?.sendEvent(event)
     }
