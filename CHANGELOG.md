@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.8] - 2026-11-06
+
+### Fixed
+- **Connect always failed on devices with an extended locale (Android)**: Smack 4.4 derives `xml:lang` from `Locale.toString()`, so a locale such as `ar-SY-u-nu-arab` (Arabic-Indic digits) or one with a script (`zh-Hant`) produced `ar-SY-#u-nu-arab`, and ejabberd closed the stream with `invalid-xml`. The stream language is now only language + country.
+- **App crashed on the first send in debug builds (Android)**: 1.0.7's `RawStanza` failed the `Message`/`Presence`/`IQ` `assert` in `AbstractXMPPConnection.sendStanza`; D8 keeps asserts enabled in debuggable builds, and the `AssertionError` escaped the `Exception` handler. Raw stanzas are now written through `sendStanzaInternal` (still counted by XEP-0198).
+
 ## [1.0.7] - 2026-11-05
 
 ### Security
