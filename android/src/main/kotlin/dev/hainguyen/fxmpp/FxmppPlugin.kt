@@ -148,7 +148,13 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                     .setPort(port)
                     .setXmppDomain(domain)
                     .setResource(resource)
-                
+                    // Smack 4.4 renders xml:lang as Locale.toString() with
+                    // '_'→'-', so locales carrying a script or extension
+                    // (e.g. ar-SY-u-nu-arab → "ar-SY-#u-nu-arab") produce an
+                    // invalid tag and ejabberd closes the stream with
+                    // invalid-xml. Keep only language + country.
+                    .setLanguage(Locale.getDefault().let { Locale(it.language, it.country) })
+
                 if (useSSL) {
                     configBuilder.setSecurityMode(ConnectionConfiguration.SecurityMode.required)
                 } else {
@@ -160,7 +166,7 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
                 }
                 
                 val config = configBuilder.build()
-                connection = XMPPTCPConnection(config)
+                connection = FxmppTcpConnection(config)
 
                 val listener = object : ConnectionListener {
                     override fun connected(connection: XMPPConnection) {
@@ -296,7 +302,7 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         
         sendExecutor.execute {
             try {
-                conn.sendStanza(RawStanza(xmlString))
+                (conn as FxmppTcpConnection).sendRawStanza(RawStanza(xmlString))
                 mainHandler.post {
                     result.success(true)
                 }
@@ -1235,9 +1241,8 @@ class MucEventStreamHandler : EventChannel.StreamHandler {
 /// Smack can only re-serialize what it has a provider for; anything else is
 /// mangled on the way out (see [FxmppPlugin.handleSendStanza]). Unlike a Nonza,
 /// a Stanza is tracked by XEP-0198 stream management, so the server's ack
-/// counters stay in step with Smack's. (AbstractXMPPConnection.sendStanza has a
-/// Java `assert` that the stanza is a Message/Presence/IQ; assertions are
-/// disabled on ART, and the writer only ever calls toXML.)
+/// counters stay in step with Smack's. Send it with
+/// [FxmppTcpConnection.sendRawStanza], never sendStanza (see there).
 class RawStanza(private val xml: String) : Stanza() {
     /// Root element name (message / presence / iq), read from the XML itself.
     private val elementName: String =
@@ -1246,6 +1251,18 @@ class RawStanza(private val xml: String) : Stanza() {
     override fun getElementName(): String = elementName
     override fun toXML(enclosingNamespace: XmlEnvironment?): CharSequence = xml
     override fun toString(): String = xml
+}
+
+/// AbstractXMPPConnection.sendStanza asserts the stanza is a Message/Presence/IQ.
+/// D8 keeps Java asserts live in debuggable builds, so sending a [RawStanza]
+/// through it throws AssertionError (an Error, not an Exception) and kills the
+/// app. This mirrors sendStanza minus that assert; the skipped interceptors
+/// only ever match Message/Presence instances, so they never saw a RawStanza.
+class FxmppTcpConnection(config: XMPPTCPConnectionConfiguration) : XMPPTCPConnection(config) {
+    fun sendRawStanza(stanza: RawStanza) {
+        throwNotConnectedExceptionIfAppropriate()
+        sendStanzaInternal(stanza)
+    }
 }
 
 // Trust manager for self-signed certificates
