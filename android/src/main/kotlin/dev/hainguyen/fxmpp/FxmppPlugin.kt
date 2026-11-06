@@ -329,7 +329,13 @@ class FxmppPlugin: FlutterPlugin, MethodCallHandler {
         // messages with a <body> from a full JID, which silently dropped MUC
         // groupchat traffic, error bounces, headlines, server notices and
         // archive pages. Dart filters what it needs.
-        conn.addAsyncStanzaListener({ stanza ->
+        //
+        // Sync, not async: Smack runs async listeners on a thread pool with no
+        // ordering between stanzas, so a MAM page's closing IQ <fin> could
+        // reach Dart before its <result> messages and those records were lost.
+        // Sync listeners run in arrival order on one thread; the body only
+        // serializes and posts to the (FIFO) main looper, so it never blocks.
+        conn.addSyncStanzaListener({ stanza ->
             val xmlString = stanza.toXML().toString()
             when (stanza) {
                 is Message -> {
